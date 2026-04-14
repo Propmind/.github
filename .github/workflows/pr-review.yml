@@ -1,0 +1,202 @@
+name: PR Review (Reusable)
+
+on:
+  workflow_call:
+    inputs:
+      pr_number:
+        required: true
+        type: number
+        description: "Pull request number to review"
+      convention_docs:
+        required: true
+        type: string
+        description: "Comma-separated list of convention doc paths to read (e.g., 'AGENTS.md,.github/copilot-instructions.md')"
+      service_type:
+        required: false
+        type: string
+        default: ""
+        description: "Optional service type hint (e.g., python-fastapi, react-typescript). Agent infers from code if omitted."
+      mode:
+        required: false
+        type: string
+        default: "auto"
+        description: "Review mode: 'auto' or 'comment'"
+      comment_author:
+        required: false
+        type: string
+        default: ""
+        description: "GitHub username who requested the review (comment mode only)"
+      model:
+        required: false
+        type: string
+        default: "claude-sonnet-4-6"
+        description: "Claude model to use for the review"
+    secrets:
+      ANTHROPIC_API_KEY:
+        required: true
+      LINEAR_API_KEY:
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  review:
+    name: Review PR
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check Linear availability
+        id: check-linear
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          if [ -n "$LINEAR_API_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create MCP config
+        if: steps.check-linear.outputs.available == 'true'
+        env:
+          LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+        run: |
+          python3 -c "
+          import json, os
+          config = {
+            'mcpServers': {
+              'linear': {
+                'type': 'stdio',
+                'command': 'npx',
+                'args': ['-y', '@linear/mcp-server'],
+                'env': {'LINEAR_API_KEY': os.environ['LINEAR_API_KEY']}
+              }
+            }
+          }
+          with open('/tmp/mcp-config.json', 'w') as f:
+            json.dump(config, f)
+          "
+
+      - uses: anthropics/claude-code-action@beta
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          model: ${{ inputs.model }}
+          pr_number: ${{ inputs.pr_number }}
+          claude_args: ${{ steps.check-linear.outputs.available == 'true' && '--mcp-config /tmp/mcp-config.json' || '' }}
+          prompt: |
+            You are an experienced code reviewer for Propmind (Brazilian real estate SaaS).
+            Review PR #${{ inputs.pr_number }} in repository ${{ github.repository }}.
+            ${{ inputs.mode == 'comment' && format('This review was requested via /review comment by @{0}.', inputs.comment_author) || '' }}
+
+            ## Phase 0: Detect Context
+
+            Use `mcp__github__get_pull_request` to fetch the PR metadata (title, body, base, head, author).
+            Use `mcp__github__get_pull_request_files` to get the list of changed files with patches.
+            Use `mcp__github__get_pull_request_status` to get CI status.
+            ${{ inputs.mode == 'comment' && 'Use `mcp__github__get_pull_request_reviews` to check for existing reviews (avoid duplicating findings already addressed).' || '' }}
+
+            Extract Linear issue ID from branch name using pattern `[A-Za-z]{2,5}-\d+` (normalize to UPPERCASE).
+            Examples: `fix/pmt-4-charges` -> `PMT-4`, `PRO-219/feature` -> `PRO-219`.
+
+            Classify batch size by total lines changed (additions + deletions):
+            - XS: <50 | S: 50-200 | M: 200-500 | L: 500-1000 | XL: 1000+
+
+            ## Phase 1: Gather Context
+
+            Read the following convention documents to understand this project's rules and patterns.
+            Each path is relative to the repository root (comma-separated):
+            ${{ inputs.convention_docs }}
+
+            Read each file before analyzing the code. These documents are the **authority** for convention
+            violations -- only report violations of rules explicitly documented in these files.
+
+            If a Linear issue ID was found, fetch it using `mcp__linear__get_issue` with the identifier
+            as `issueId` to get the task title, description, and acceptance criteria.
+
+            ## Phase 2: Analyze
+
+            ${{ inputs.service_type != '' && format('This repository''s service type is: **{0}**', inputs.service_type) || '' }}
+
+            Review each changed file. Classify every finding:
+            - **CRITICAL**: bugs, security issues, data loss, violated invariants -> blocks merge
+            - **WARNING**: convention violations, missing tests, code smells -> recommended fix
+            - **INFO**: suggestions, minor improvements -> optional
+
+            ### Common checklist (all projects)
+            - Commits follow `type(scope): description` (Conventional Commits)?
+            - Any secrets, API keys, or tokens in the diff?
+            - Changes out of scope of the PR/task?
+            - If Linear issue found: do changes satisfy acceptance criteria?
+
+            ### Language best practices
+            For Python projects: PEP 8, type hints on new/changed signatures, no blocking calls in async context, tests for new/changed functions.
+            For TypeScript/React projects: proper typing, no `any` where avoidable, tests for new/changed logic.
+
+            ### Project-specific rules
+            The convention documents you read in Phase 1 are the **sole authority** for project-specific rules.
+            Only flag violations of rules **explicitly documented** in those files.
+            Do not invent or assume rules that are not written there.
+
+            For XL diffs (1000+ lines): read `--stat` first, then focus on the most critical files
+            (new files, validators, routes/pages, main components). Flag XL size as a primary finding.
+
+            ## Phase 3: Report and Publish
+
+            Format the review as:
+
+            ```
+            ## PR Review: {title}
+
+            ### Context
+            - **Repository**: {owner/repo}
+            - **Branch**: {head} -> {base}
+            - **Linear**: {ID -- title} | "No Linear issue linked"
+            - **Size**: {XS/S/M/L/XL} ({N} lines across {M} files)
+            - **CI Status**: {passing/failing/pending}
+
+            ### Linear Alignment
+            {If issue found: assessment of adherence to acceptance criteria}
+            {If not found: "No linked issue -- review based on code only"}
+
+            ### Highlights
+            - {Good practices, clean design, complete tests worth recognizing}
+
+            ### Findings
+
+            #### CRITICAL ({count})
+            - **{file:line}** -- {description} -- {suggestion}
+
+            #### WARNING ({count})
+            - **{file:line}** -- {description} -- {suggestion}
+
+            #### INFO ({count})
+            - **{file:line}** -- {description} -- {suggestion}
+
+            If a section has no findings, include it with "None" to show it was checked.
+
+            ### Stats
+            - Files reviewed: N
+            - Lines changed: +N / -N (size: XS/S/M/L/XL)
+            - Findings: N critical, N warning, N info
+
+            ### Verdict
+            {APPROVE | REQUEST_CHANGES | COMMENT} -- {one-line justification}
+            ```
+
+            Then publish immediately using `mcp__github__create_pull_request_review` with:
+            - `owner` and `repo` extracted from ${{ github.repository }}
+            - `pull_number`: ${{ inputs.pr_number }}
+            - `body`: the formatted review
+            - `event`:
+              - Any CRITICAL finding -> `REQUEST_CHANGES`
+              - Only WARNING/INFO -> `COMMENT`
+              - No negative findings -> `APPROVE`
+
+            **Do not ask for confirmation. Publish directly.**
