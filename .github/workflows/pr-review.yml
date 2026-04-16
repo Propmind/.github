@@ -88,6 +88,7 @@ jobs:
       - uses: anthropics/claude-code-action@beta
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          github_token: ${{ github.token }}
           model: ${{ inputs.model }}
           pr_number: ${{ inputs.pr_number }}
           claude_args: ${{ steps.check-linear.outputs.available == 'true' && '--mcp-config /tmp/mcp-config.json' || '' }}
