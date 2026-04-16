@@ -66,10 +66,11 @@ jobs:
 
       - name: Create MCP config
         if: steps.check-linear.outputs.available == 'true'
+        id: mcp-config
         env:
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
         run: |
-          python3 -c "
+          CONFIG=$(python3 -c "
           import json, os
           config = {
             'mcpServers': {
@@ -81,18 +82,17 @@ jobs:
               }
             }
           }
-          with open('/tmp/mcp-config.json', 'w') as f:
-            json.dump(config, f)
-          "
+          print(json.dumps(config))
+          ")
+          echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
 
       - uses: anthropics/claude-code-action@beta
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           model: ${{ inputs.model }}
-          pr_number: ${{ inputs.pr_number }}
-          claude_args: ${{ steps.check-linear.outputs.available == 'true' && '--mcp-config /tmp/mcp-config.json' || '' }}
-          prompt: |
+          mcp_config: ${{ steps.check-linear.outputs.available == 'true' && steps.mcp-config.outputs.config || '' }}
+          direct_prompt: |
             You are an experienced code reviewer for Propmind (Brazilian real estate SaaS).
             Review PR #${{ inputs.pr_number }} in repository ${{ github.repository }}.
             ${{ inputs.mode == 'comment' && format('This review was requested via /review comment by @{0}.', inputs.comment_author) || '' }}
