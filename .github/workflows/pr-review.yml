@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Check Linear availability
         id: check-linear
@@ -97,59 +97,163 @@ jobs:
             Review PR #${{ inputs.pr_number }} in repository ${{ github.repository }}.
             ${{ inputs.mode == 'comment' && format('This review was requested via /review comment by @{0}.', inputs.comment_author) || '' }}
 
-            ## Phase 0: Detect Context
+            ---
 
-            Use `mcp__github__get_pull_request` to fetch the PR metadata (title, body, base, head, author).
-            Use `mcp__github__get_pull_request_files` to get the list of changed files with patches.
-            Use `mcp__github__get_pull_request_status` to get CI status.
-            ${{ inputs.mode == 'comment' && 'Use `mcp__github__get_pull_request_reviews` to check for existing reviews (avoid duplicating findings already addressed).' || '' }}
+            ## Phase 0 — Detect Context
+
+            Run in parallel:
+            - `mcp__github__get_pull_request` — fetch PR metadata (title, body, base, head, author)
+            - `mcp__github__get_pull_request_files` — list of changed files with patches
+            - `mcp__github__get_pull_request_status` — CI status
+            ${{ inputs.mode == 'comment' && '- `mcp__github__get_pull_request_reviews` — check existing reviews to avoid duplicating addressed findings' || '' }}
 
             Extract Linear issue ID from branch name using pattern `[A-Za-z]{2,5}-\d+` (normalize to UPPERCASE).
-            Examples: `fix/pmt-4-charges` -> `PMT-4`, `PRO-219/feature` -> `PRO-219`.
+            Examples: `fix/pmt-4-charges` → `PMT-4`, `PRO-219/feature` → `PRO-219`.
 
-            Classify batch size by total lines changed (additions + deletions):
-            - XS: <50 | S: 50-200 | M: 200-500 | L: 500-1000 | XL: 1000+
+            **Batch size** — classify by total lines changed (additions + deletions):
+            | Size | Lines | Action |
+            |---|---|---|
+            | XS | < 50 | No note |
+            | S | 50–200 | No note |
+            | M | 200–500 | Healthy range |
+            | L | 500–1000 | Emit WARNING suggesting where to split |
+            | XL | 1000+ | Make batch size the **main finding** — defect detection drops to ~28%; focus on how to decompose |
 
-            ## Phase 1: Gather Context
+            **Read strategy:**
+            - `SINGLE_DIFF` for XS/S or ≤ 2 commits
+            - `PER_COMMIT` for M+ with 3+ well-structured commits
+            - `SINGLE_DIFF + INFO` for messy commits
 
-            Read the following convention documents to understand this project's rules and patterns.
-            Each path is relative to the repository root (comma-separated):
-            ${{ inputs.convention_docs }}
+            ---
 
-            Read each file before analyzing the code. These documents are the **authority** for convention
-            violations -- only report violations of rules explicitly documented in these files.
+            ## Phase 1 — Gather
 
-            If a Linear issue ID was found, fetch it using `mcp__linear__get_issue` with the identifier
-            as `issueId` to get the task title, description, and acceptance criteria.
+            Run in parallel:
+            - **Convention docs**: read each path listed below (relative to repo root, comma-separated):
+              ${{ inputs.convention_docs }}
+              These are the **sole authority** for convention violations — only flag rules explicitly documented in these files.
+            - **Linear context**: if a Linear ID was found, call `mcp__linear__linear_get_issue` with the identifier to get title, description, and acceptance criteria.
+            - **PR discussion**: fetch `gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments` to extract author contests of prior findings.
 
-            ## Phase 2: Analyze
+            For L/XL PRs apply risk-based file prioritization:
+            | Tier | Criteria | Scrutiny |
+            |---|---|---|
+            | 1 — Critical | New source files, migrations, auth, financial/business logic | Deep review: read whole file, verify invariants |
+            | 2 — Standard | Modified source files | Full diff review |
+            | 3 — Scan | Test files | Verify coverage and anti-patterns only |
+            | 4 — Skip | Binaries, auto-generated, formatting-only | Note presence, don't review content |
 
-            ${{ inputs.service_type != '' && format('This repository''s service type is: **{0}**', inputs.service_type) || '' }}
+            For `PER_COMMIT` strategy: read each commit diff in chronological order, annotate intent and observations before reading the consolidated diff.
 
-            Review each changed file. Classify every finding:
-            - **CRITICAL**: bugs, security issues, data loss, violated invariants -> blocks merge
-            - **WARNING**: convention violations, missing tests, code smells -> recommended fix
-            - **INFO**: suggestions, minor improvements -> optional
+            ---
+
+            ## Phase 2 — Analyze
+
+            ${{ inputs.service_type != '' && format('Service type: **{0}**', inputs.service_type) || '' }}
+
+            Severity scale: **CRITICAL** (blocks merge) · **WARNING** (recommended fix) · **INFO** (suggestion)
 
             ### Common checklist (all projects)
-            - Commits follow `type(scope): description` (Conventional Commits)?
+            - Commits follow Conventional Commits `type(scope): description`?
             - Any secrets, API keys, or tokens in the diff?
-            - Changes out of scope of the PR/task?
-            - If Linear issue found: do changes satisfy acceptance criteria?
+            - Changes outside the PR/task scope?
+            - If Linear issue linked: do changes satisfy the acceptance criteria?
+            - If author contested any prior findings: verify against actual code before emitting or discarding.
 
-            ### Language best practices
-            For Python projects: PEP 8, type hints on new/changed signatures, no blocking calls in async context, tests for new/changed functions.
-            For TypeScript/React projects: proper typing, no `any` where avoidable, tests for new/changed logic.
+            ### Project-specific checklists
 
-            ### Project-specific rules
-            The convention documents you read in Phase 1 are the **sole authority** for project-specific rules.
-            Only flag violations of rules **explicitly documented** in those files.
-            Do not invent or assume rules that are not written there.
+            #### Python — all services (api, workflow-engine, boleto-extractor, consumer-baas, clicksign-worker)
+            - PEP 8: snake_case, import organization
+            - Type hints on new/modified function signatures
+            - Async/await: no blocking calls in async context
+            - Tests for new or modified functions
 
-            For XL diffs (1000+ lines): read `--stat` first, then focus on the most critical files
-            (new files, validators, routes/pages, main components). Flag XL size as a primary finding.
+            #### api (propmind-core/api)
+            - Route → Resource → Validator pattern respected
+            - Never `session.commit()` or `session.rollback()` manually (context manager handles it)
+            - Validators called before any data mutation
+            - Pydantic schemas for request/response
+            - Security dependencies on routes (`RequireAuth`, `RequireAdmin`, `RequireAdminOrOperation`, `RequireAgency`)
+            - Tests in `tests/unit/`, `tests/integration/`, `tests/e2e/` with pytest markers
+            - Private validator methods (e.g. `_validate_x`) must be called from `validate()`; grep to confirm call site — method without call site is dead code
+            - Double-write: if a factory/service call already persists a field on the returned object, don't set it again; one write only
+            - Validator tests must call the **public method** (`validate()`), not private methods directly
 
-            ## Phase 3: Report and Publish
+            #### workflow-engine (propmind-core/workflow-engine)
+            - Determinism required: no `datetime.now()`, `random`, or direct API/DB calls inside workflows
+            - Use `workflow.now()` and `workflow.random()` inside workflows
+            - External operations are activities, never workflows
+            - Task queue format: `{env}-{workflow_type}` (e.g. `dev-validation`)
+            - Workflow ID format: `{workflow_type}:{business_entity_id}[:{cycle}]`
+            - Required search attributes: `environment`, `tenant_id`, `workflow_type`, `business_status`
+            - Distinguish technical errors from business errors
+
+            #### control-panel-ui
+            - **Golden rule**: existing entity = 100% pre-populated form, no "Select..." placeholders for existing data
+            - `showToast` from `@/lib/toasts` — never import `toast` from `sonner` directly
+            - Icons: `lucide-react` only, no custom `strokeWidth`
+            - Semantic color tokens only — never `text-white`, `bg-black`, `text-gray-*`, `text-amber-*`, `bg-amber-*`, `border-amber-*`, `text-green-*`, `bg-green-*`, `border-green-*`, `hover:border-gray-*`; replacements: warning/amber → `bg-warning-10 text-warning-100`; success/green → `bg-success-light text-success`; neutral borders → `hover:border-border`; white backgrounds → `bg-background`
+            - **`size="default"` on all buttons** — NEVER `size="sm"` in drawers/modals, including inline remove/delete buttons (Trash2, X). Check ALL `<Button` in the diff
+            - API calls via React Query hooks only — never `axios` directly in components
+            - Drawers: `side="drawer"`, `showOverlay={false}`, `modal={false}`
+            - Edit forms: fields pre-populated, masks applied (CPF, CNPJ, phone, CEP, currency)
+            - Destructive actions use `AlertDialog` for confirmation
+            - `overflow-y-scroll` on main (not `auto`), `modal={false}` on Radix components
+            - UI text in Portuguese, code in English
+            - Every new file in `src/lib/api/*.ts` or `src/lib/hooks/*.ts` **must** have a corresponding `*.test.ts(x)` file — absence is WARNING
+
+            #### boleto-extractor
+            - `toDict()` for DSPy results — never `dir()`
+            - Gender/marital status normalized to English before API calls
+            - Address fields flat (not nested) for Propmind API integration
+            - "Step" terminology (never "Checkpoint") in agent messages
+            - No internal terminology exposed in user-facing messages
+
+            #### consumer-baas
+            - Clear separation between webhook receiver (`lambda_webhook_receiver.py`) and queue consumer (`lambda_queue_consumer.py`) — never mix responsibilities
+            - Webhooks must be idempotent (same payload twice = same effect); verify idempotency keys/guards before side effects
+            - SQS messages follow `docs/05-message-specification.md`; webhook payloads follow `docs/10-webhook-specification.md`
+            - Asaas API calls isolated in `asaas_client.py`; don't call API directly from handlers/controllers
+            - Secrets via AWS Secrets Manager (`app/core/secrets.py`), never hardcoded or via env var in prod
+            - SQS batch failures must return `batchItemFailures` for selective retry (don't fail the whole batch)
+            - Tests with Localstack (not direct AWS SDK mocks)
+
+            #### clicksign-worker
+            - Clear separation: webhook handler (`lambda_webhook_handler.py`) enqueues and responds fast; SQS worker (`lambda_function.py`) processes
+            - Clicksign API calls isolated in `clicksign_client.py`
+            - Webhook handler validates signature via `CLICKSIGN_WEBHOOK_KEY` where applicable
+            - SQS worker returns `batchItemFailures` for selective retry; don't fail the whole batch
+            - Config exclusively via env vars in `app/config/settings.py`; never hardcoded
+            - Terraform infra in `infra/live/dev/` must accompany changes that require new AWS resources
+            - DTOs/enums/exceptions organized in `app/dto/`, `app/enum/`, `app/exception/`
+
+            ### Tier 1 failure mode analysis (migrations, auth, financial logic)
+            For each Tier 1 change ask:
+            - "What if this fails silently?" → insufficient error handling, fire-and-forget without tracking
+            - "What happens to pre-existing data?" → backward compat breaks, orphaned data, queries missing old states
+            - "Does this work in all envs (dev/staging/prod)?" → hardcoded config, fixed schemas, missing feature flags
+            - "What if this runs twice?" → missing idempotency, duplicates, non-idempotent side effects
+
+            Only generate a finding when the answer reveals a **concrete problem** in the code — no speculative findings.
+
+            ### Cross-commit analysis (PER_COMMIT strategy only)
+            After per-file review:
+            - **DRY cross-commit**: same pattern, dict, helper, or constant introduced in multiple commits
+            - **Approach inconsistency**: same problem solved differently across commits
+            - **Scope drift**: commits that stray from the PR's main theme (INFO — suggest separate PR)
+            - **Evolution regression**: commit N fixes something commit N-1 introduced incorrectly
+
+            ### Reviewer rules
+            - **Flag, don't fix** — report issues and suggest directions; never rewrite the author's code
+            - **Cite evidence** — every finding must reference `file:line`; vague findings are not findings
+            - **Proportionality** — don't nitpick style when there are logic bugs
+            - **Acknowledge quality** — good patterns, clean abstractions, and complete tests deserve recognition
+            - **Zero false positives** — verify each finding against real code; when in doubt, lower severity or note uncertainty
+            - **Author comments are evidence** — if the author contested a finding with code references, verify before carrying it forward
+
+            ---
+
+            ## Phase 3 — Report and Publish
 
             Format the review as:
 
@@ -158,28 +262,35 @@ jobs:
 
             ### Context
             - **Repository**: {owner/repo}
-            - **Branch**: {head} -> {base}
-            - **Linear**: {ID -- title} | "No Linear issue linked"
-            - **Size**: {XS/S/M/L/XL} ({N} lines across {M} files)
+            - **Branch**: {head} → {base}
+            - **Linear**: {ID — title} | "No linked Linear issue"
+            - **Size**: {XS/S/M/L/XL} ({N} lines in {M} files)
             - **CI Status**: {passing/failing/pending}
 
-            ### Linear Alignment
-            {If issue found: assessment of adherence to acceptance criteria}
-            {If not found: "No linked issue -- review based on code only"}
+            ### Commit Analysis (PER_COMMIT strategy only)
+            | # | Commit | Type | Summary | Observations |
+            |---|--------|------|---------|--------------|
+            | 1 | `{sha[:7]}` | {type} | {message} | {observation or "OK"} |
 
-            ### Highlights
-            - {Good practices, clean design, complete tests worth recognizing}
+            **Cross-commit**: {1-2 line summary, or "No cross-commit issues identified"}
+
+            ### Linear Alignment
+            {If issue found: evaluation of adherence to acceptance criteria}
+            {If not found: "No linked issue — review based on code only"}
+
+            ### Positives
+            - {Good practices, clean design, complete tests}
 
             ### Findings
 
             #### CRITICAL ({count})
-            - **{file:line}** -- {description} -- {suggestion}
+            - **{file:line}** — {description} — {suggestion}
 
             #### WARNING ({count})
-            - **{file:line}** -- {description} -- {suggestion}
+            - **{file:line}** — {description} — {suggestion}
 
             #### INFO ({count})
-            - **{file:line}** -- {description} -- {suggestion}
+            - **{file:line}** — {description} — {suggestion}
 
             If a section has no findings, include it with "None" to show it was checked.
 
@@ -189,16 +300,15 @@ jobs:
             - Findings: N critical, N warning, N info
 
             ### Verdict
-            {APPROVE | REQUEST_CHANGES | COMMENT} -- {one-line justification}
+            {APPROVE | REQUEST_CHANGES | COMMENT} — {one-line justification}
             ```
+
+            Verdict logic: any CRITICAL → `REQUEST_CHANGES` · no negatives → `APPROVE` · WARNING/INFO only → `COMMENT`
 
             Then publish immediately using `mcp__github__create_pull_request_review` with:
             - `owner` and `repo` extracted from ${{ github.repository }}
             - `pull_number`: ${{ inputs.pr_number }}
             - `body`: the formatted review
-            - `event`:
-              - Any CRITICAL finding -> `REQUEST_CHANGES`
-              - Only WARNING/INFO -> `COMMENT`
-              - No negative findings -> `APPROVE`
+            - `event`: `REQUEST_CHANGES` / `APPROVE` / `COMMENT` per verdict logic above
 
             **Do not ask for confirmation. Publish directly.**
