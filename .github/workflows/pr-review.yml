@@ -139,10 +139,13 @@ jobs:
         run: |
           set -euo pipefail
           pip install --quiet semgrep
-          # Only report findings introduced by the PR (delta vs main).
-          # Pre-existing legacy violations stay quiet.
+          # Only report findings introduced by the PR (delta vs its base branch).
+          # Pre-existing legacy violations stay quiet. Use the PR's base ref —
+          # `main` in propmind-core, `develop` in control-panel-ui — so the
+          # diff is against the right reference per repo's branching model.
+          BASE_REF="${{ github.base_ref }}"
           semgrep --config .semgrep/propmind-conventions.yml \
-            --baseline-commit origin/main \
+            --baseline-commit "origin/${BASE_REF}" \
             --json --output /tmp/semgrep.json \
             . || true
 
