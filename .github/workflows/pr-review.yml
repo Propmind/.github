@@ -185,7 +185,7 @@ jobs:
 
             For L/XL PRs apply risk-based file prioritization (see "Risk-based file prioritization" in the rule blocks below).
 
-            For `PER_COMMIT` strategy: read each commit diff in chronological order, annotate intent and observations before reading the consolidated diff.
+            For `PER_COMMIT` strategy: read the consolidated diff first. Only inspect an individual commit when the consolidated diff has ambiguous intent for a hunk (e.g., adjacent additions and deletions that may be a refactor or a rewrite). Do not pre-read every commit before the consolidated.
 
             ---
 
