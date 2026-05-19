@@ -133,6 +133,39 @@ jobs:
             echo "RULES_EOF"
           } >> "$GITHUB_OUTPUT"
 
+      - name: Run semgrep pre-pass
+        id: semgrep
+        if: hashFiles('.semgrep/propmind-conventions.yml') != ''
+        run: |
+          set -euo pipefail
+          pip install --quiet semgrep
+          # Only report findings introduced by the PR (delta vs main).
+          # Pre-existing legacy violations stay quiet.
+          semgrep --config .semgrep/propmind-conventions.yml \
+            --baseline-commit origin/main \
+            --json --output /tmp/semgrep.json \
+            . || true
+
+          if [ ! -f /tmp/semgrep.json ]; then
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            echo "findings=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          COUNT=$(jq '.results | length' /tmp/semgrep.json)
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          if [ "$COUNT" -gt 0 ]; then
+            FINDINGS=$(jq -r '.results[] | "- **`\(.path):\(.start.line)`** [`\(.check_id)` — \(.extra.severity)] — \(.extra.message | gsub("\n";" ") | .[:400])"' /tmp/semgrep.json)
+            {
+              echo "findings<<SG_EOF"
+              echo "$FINDINGS"
+              echo "SG_EOF"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "findings=" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: anthropics/claude-code-action@beta
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -204,6 +237,17 @@ jobs:
             ### Risk-based file prioritization (apply when batch size is L or XL)
 
             ${{ steps.rules.outputs.large_pr }}
+
+            ### Deterministic findings (semgrep pre-pass)
+
+            The following findings were emitted by the caller repo's `.semgrep/propmind-conventions.yml` against the diff since `main`:
+
+            ${{ steps.semgrep.outputs.count != '' && steps.semgrep.outputs.count != '0' && steps.semgrep.outputs.findings || '(no new violations of deterministic conventions)' }}
+
+            **These findings are AUTHORITATIVE.** Include them verbatim in your `Findings` section under the appropriate severity:
+            - `propmind.backend.session-mutation-without-commit` → CRITICAL
+            - All other `propmind.*` rule IDs → use the severity from the semgrep output line above
+            **Do NOT re-emit equivalent findings from your own analysis** — your job is to find issues these deterministic rules cannot catch.
 
             ---
 
