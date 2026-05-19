@@ -92,6 +92,7 @@ jobs:
           github_token: ${{ github.token }}
           model: ${{ inputs.model }}
           mcp_config: ${{ steps.check-linear.outputs.available == 'true' && steps.mcp-config.outputs.config || '' }}
+          allowed_tools: "mcp__github__create_pull_request_review,Bash(cat:*),Bash(gh api:*)"
           direct_prompt: |
             You are an experienced code reviewer for Propmind (Brazilian real estate SaaS).
             Review PR #${{ inputs.pr_number }} in repository ${{ github.repository }}.
@@ -305,10 +306,20 @@ jobs:
 
             Verdict logic: any CRITICAL → `REQUEST_CHANGES` · no negatives → `APPROVE` · WARNING/INFO only → `COMMENT`
 
-            Then publish immediately using `mcp__github__create_pull_request_review` with:
-            - `owner` and `repo` extracted from ${{ github.repository }}
-            - `pull_number`: ${{ inputs.pr_number }}
-            - `body`: the formatted review
-            - `event`: `REQUEST_CHANGES` / `APPROVE` / `COMMENT` per verdict logic above
+            **Publish using this deterministic sequence — do NOT deviate:**
 
-            **Do not ask for confirmation. Publish directly.**
+            1. Try `mcp__github__create_pull_request_review` with:
+               - `owner` and `repo` extracted from ${{ github.repository }}
+               - `pull_number`: ${{ inputs.pr_number }}
+               - `body`: the formatted review
+               - `event`: `REQUEST_CHANGES` / `APPROVE` / `COMMENT` per verdict logic above
+            2. If step 1 fails with a body-size or escaping error, write the body to `/tmp/pr_review.md` using a single `cat <<'REVIEW_EOF' > /tmp/pr_review.md` HEREDOC (quoted sentinel to prevent shell expansion), then publish via:
+               ```
+               gh api repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews \
+                 --method POST \
+                 --field event="<event>" \
+                 --field "body=@/tmp/pr_review.md"
+               ```
+            3. If step 2 also fails, **stop**. Report the error verbatim in your final message. Do **NOT** try `curl`, scripts, sub-agents, or any other tool variant. A failure to publish is acceptable; a retry storm is not.
+
+            Do not ask for confirmation. Publish directly.
