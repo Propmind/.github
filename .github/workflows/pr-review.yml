@@ -142,8 +142,8 @@ jobs:
           allowed_tools: "mcp__github__create_pull_request_review,Bash(cat:*),Bash(gh api:*)"
           direct_prompt: |
             You are an experienced code reviewer for Propmind (Brazilian real estate SaaS).
-            Review PR #${{ inputs.pr_number }} in repository ${{ github.repository }}.
-            ${{ inputs.mode == 'comment' && format('This review was requested via /review comment by @{0}.', inputs.comment_author) || '' }}
+
+            Review the pull request identified in the "Run-specific context" block at the END of this prompt, following the 4-phase process below. The orchestration instructions and rule blocks are byte-identical across runs in the same repo to maximize prompt-cache reuse — keep this in mind when editing.
 
             ---
 
@@ -153,7 +153,7 @@ jobs:
             - `mcp__github__get_pull_request` — fetch PR metadata (title, body, base, head, author)
             - `mcp__github__get_pull_request_files` — list of changed files with patches
             - `mcp__github__get_pull_request_status` — CI status
-            ${{ inputs.mode == 'comment' && '- `mcp__github__get_pull_request_reviews` — check existing reviews to avoid duplicating addressed findings' || '' }}
+            - If the run is in `comment` mode (see Run-specific context): also call `mcp__github__get_pull_request_reviews` to check existing reviews and avoid duplicating addressed findings.
 
             Extract Linear issue ID from branch name using pattern `[A-Za-z]{2,5}-\d+` (normalize to UPPERCASE).
             Examples: `fix/pmt-4-charges` → `PMT-4`, `PRO-219/feature` → `PRO-219`.
@@ -177,11 +177,9 @@ jobs:
             ## Phase 1 — Gather
 
             Run in parallel:
-            - **Convention docs**: read each path listed below (relative to repo root, comma-separated):
-              ${{ inputs.convention_docs }}
-              These are the **sole authority** for convention violations — only flag rules explicitly documented in these files.
+            - **Convention docs**: read each path listed in "Convention docs" (see Run-specific context, comma-separated, relative to repo root). These are the **sole authority** for convention violations — only flag rules explicitly documented in these files.
             - **Linear context**: if a Linear ID was found, call `mcp__linear__linear_get_issue` with the identifier to get title, description, and acceptance criteria.
-            - **PR discussion**: fetch `gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments` to extract author contests of prior findings.
+            - **PR discussion**: fetch the issue comments for this PR (via `mcp__github__get_pull_request` already includes comments, or use the issue comments endpoint with the PR number from Run-specific context) to extract author contests of prior findings.
 
             For L/XL PRs apply risk-based file prioritization (see "Risk-based file prioritization" in the rule blocks below).
 
@@ -190,8 +188,6 @@ jobs:
             ---
 
             ## Phase 2 — Analyze
-
-            ${{ inputs.service_type != '' && format('Service type: **{0}**', inputs.service_type) || '' }}
 
             Severity scale: **CRITICAL** (blocks merge) · **WARNING** (recommended fix) · **INFO** (suggestion)
 
@@ -222,17 +218,29 @@ jobs:
             **Publish using this deterministic sequence — do NOT deviate:**
 
             1. Try `mcp__github__create_pull_request_review` with:
-               - `owner` and `repo` extracted from ${{ github.repository }}
-               - `pull_number`: ${{ inputs.pr_number }}
+               - `owner` and `repo` extracted from the repo identifier in Run-specific context
+               - `pull_number`: the PR number from Run-specific context
                - `body`: the formatted review
                - `event`: `REQUEST_CHANGES` / `APPROVE` / `COMMENT` per verdict logic above
             2. If step 1 fails with a body-size or escaping error, write the body to `/tmp/pr_review.md` using a single `cat <<'REVIEW_EOF' > /tmp/pr_review.md` HEREDOC (quoted sentinel to prevent shell expansion), then publish via:
                ```
-               gh api repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews \
+               gh api repos/<owner/repo>/pulls/<pr_number>/reviews \
                  --method POST \
                  --field event="<event>" \
                  --field "body=@/tmp/pr_review.md"
                ```
+               substituting `<owner/repo>` and `<pr_number>` from Run-specific context.
             3. If step 2 also fails, **stop**. Report the error verbatim in your final message. Do **NOT** try `curl`, scripts, sub-agents, or any other tool variant. A failure to publish is acceptable; a retry storm is not.
 
             Do not ask for confirmation. Publish directly.
+
+            ---
+
+            ## Run-specific context
+
+            - **Repository**: ${{ github.repository }}
+            - **Pull request number**: ${{ inputs.pr_number }}
+            - **Run mode**: ${{ inputs.mode }}${{ inputs.mode == 'comment' && format(' — review requested via /review comment by @{0}', inputs.comment_author) || '' }}
+            - **Service type hint**: ${{ inputs.service_type != '' && inputs.service_type || '(none — infer from code)' }}
+            - **Convention docs** (comma-separated paths from caller workflow):
+              ${{ inputs.convention_docs }}
