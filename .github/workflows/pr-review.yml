@@ -86,6 +86,53 @@ jobs:
           ")
           echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
 
+      - name: Load review rules from Propmind/.github
+        id: rules
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # Map caller repo → project fragment
+          case "$REPO" in
+            Propmind/propmind-core) FRAGMENT="project-api" ;;
+            Propmind/control-panel-ui) FRAGMENT="project-control-panel-ui" ;;
+            Propmind/boleto-extractor) FRAGMENT="project-boleto-extractor" ;;
+            Propmind/consumer-baas) FRAGMENT="project-consumer-baas" ;;
+            Propmind/clicksign-worker) FRAGMENT="project-clicksign-worker" ;;
+            *) FRAGMENT="" ;;
+          esac
+
+          fetch() {
+            gh api "repos/Propmind/.github/contents/review-pr-rules/$1.md" \
+              -H "Accept: application/vnd.github.raw"
+          }
+
+          COMMON=$(fetch common)
+          TEMPLATES=$(fetch templates)
+          LARGE_PR=$(fetch large-pr-prioritization)
+          if [ -n "$FRAGMENT" ]; then
+            PROJECT=$(fetch "$FRAGMENT")
+          else
+            PROJECT="(Unmapped project — apply common checklist only.)"
+          fi
+
+          {
+            echo "common<<RULES_EOF"
+            echo "$COMMON"
+            echo "RULES_EOF"
+            echo "templates<<RULES_EOF"
+            echo "$TEMPLATES"
+            echo "RULES_EOF"
+            echo "large_pr<<RULES_EOF"
+            echo "$LARGE_PR"
+            echo "RULES_EOF"
+            echo "project<<RULES_EOF"
+            echo "$PROJECT"
+            echo "RULES_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - uses: anthropics/claude-code-action@beta
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -136,13 +183,7 @@ jobs:
             - **Linear context**: if a Linear ID was found, call `mcp__linear__linear_get_issue` with the identifier to get title, description, and acceptance criteria.
             - **PR discussion**: fetch `gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments` to extract author contests of prior findings.
 
-            For L/XL PRs apply risk-based file prioritization:
-            | Tier | Criteria | Scrutiny |
-            |---|---|---|
-            | 1 — Critical | New source files, migrations, auth, financial/business logic | Deep review: read whole file, verify invariants |
-            | 2 — Standard | Modified source files | Full diff review |
-            | 3 — Scan | Test files | Verify coverage and anti-patterns only |
-            | 4 — Skip | Binaries, auto-generated, formatting-only | Note presence, don't review content |
+            For L/XL PRs apply risk-based file prioritization (see "Risk-based file prioritization" in the rule blocks below).
 
             For `PER_COMMIT` strategy: read each commit diff in chronological order, annotate intent and observations before reading the consolidated diff.
 
@@ -154,155 +195,27 @@ jobs:
 
             Severity scale: **CRITICAL** (blocks merge) · **WARNING** (recommended fix) · **INFO** (suggestion)
 
-            ### Common checklist (all projects)
-            - Commits follow Conventional Commits `type(scope): description`?
-            - Any secrets, API keys, or tokens in the diff?
-            - Changes outside the PR/task scope?
-            - If Linear issue linked: do changes satisfy the acceptance criteria?
-            - If author contested any prior findings: verify against actual code before emitting or discarding.
+            The authoritative review rules for this run are loaded from `Propmind/.github/review-pr-rules/`:
 
-            ### Project-specific checklists
+            ### Common rules
 
-            #### Python — all services (api, workflow-engine, boleto-extractor, consumer-baas, clicksign-worker)
-            - PEP 8: snake_case, import organization
-            - Type hints on new/modified function signatures
-            - Async/await: no blocking calls in async context
-            - Tests for new or modified functions
+            ${{ steps.rules.outputs.common }}
 
-            #### api (propmind-core/api)
-            - Route → Resource → Validator pattern respected
-            - Never `session.commit()` or `session.rollback()` manually (context manager handles it)
-            - Validators called before any data mutation
-            - Pydantic schemas for request/response
-            - Security dependencies on routes (`RequireAuth`, `RequireAdmin`, `RequireAdminOrOperation`, `RequireAgency`)
-            - Tests in `tests/unit/`, `tests/integration/`, `tests/e2e/` with pytest markers
-            - Private validator methods (e.g. `_validate_x`) must be called from `validate()`; grep to confirm call site — method without call site is dead code
-            - Double-write: if a factory/service call already persists a field on the returned object, don't set it again; one write only
-            - Validator tests must call the **public method** (`validate()`), not private methods directly
+            ### Project-specific rules
 
-            #### workflow-engine (propmind-core/workflow-engine)
-            - Determinism required: no `datetime.now()`, `random`, or direct API/DB calls inside workflows
-            - Use `workflow.now()` and `workflow.random()` inside workflows
-            - External operations are activities, never workflows
-            - Task queue format: `{env}-{workflow_type}` (e.g. `dev-validation`)
-            - Workflow ID format: `{workflow_type}:{business_entity_id}[:{cycle}]`
-            - Required search attributes: `environment`, `tenant_id`, `workflow_type`, `business_status`
-            - Distinguish technical errors from business errors
+            ${{ steps.rules.outputs.project }}
 
-            #### control-panel-ui
-            - **Golden rule**: existing entity = 100% pre-populated form, no "Select..." placeholders for existing data
-            - `showToast` from `@/lib/toasts` — never import `toast` from `sonner` directly
-            - Icons: `lucide-react` only, no custom `strokeWidth`
-            - Semantic color tokens only — never `text-white`, `bg-black`, `text-gray-*`, `text-amber-*`, `bg-amber-*`, `border-amber-*`, `text-green-*`, `bg-green-*`, `border-green-*`, `hover:border-gray-*`; replacements: warning/amber → `bg-warning-10 text-warning-100`; success/green → `bg-success-light text-success`; neutral borders → `hover:border-border`; white backgrounds → `bg-background`
-            - **`size="default"` on all buttons** — NEVER `size="sm"` in drawers/modals, including inline remove/delete buttons (Trash2, X). Check ALL `<Button` in the diff
-            - API calls via React Query hooks only — never `axios` directly in components
-            - Drawers: `side="drawer"`, `showOverlay={false}`, `modal={false}`
-            - Edit forms: fields pre-populated, masks applied (CPF, CNPJ, phone, CEP, currency)
-            - Destructive actions use `AlertDialog` for confirmation
-            - `overflow-y-scroll` on main (not `auto`), `modal={false}` on Radix components
-            - UI text in Portuguese, code in English
-            - Every new file in `src/lib/api/*.ts` or `src/lib/hooks/*.ts` **must** have a corresponding `*.test.ts(x)` file — absence is WARNING
+            ### Risk-based file prioritization (apply when batch size is L or XL)
 
-            #### boleto-extractor
-            - `toDict()` for DSPy results — never `dir()`
-            - Gender/marital status normalized to English before API calls
-            - Address fields flat (not nested) for Propmind API integration
-            - "Step" terminology (never "Checkpoint") in agent messages
-            - No internal terminology exposed in user-facing messages
-
-            #### consumer-baas
-            - Clear separation between webhook receiver (`lambda_webhook_receiver.py`) and queue consumer (`lambda_queue_consumer.py`) — never mix responsibilities
-            - Webhooks must be idempotent (same payload twice = same effect); verify idempotency keys/guards before side effects
-            - SQS messages follow `docs/05-message-specification.md`; webhook payloads follow `docs/10-webhook-specification.md`
-            - Asaas API calls isolated in `asaas_client.py`; don't call API directly from handlers/controllers
-            - Secrets via AWS Secrets Manager (`app/core/secrets.py`), never hardcoded or via env var in prod
-            - SQS batch failures must return `batchItemFailures` for selective retry (don't fail the whole batch)
-            - Tests with Localstack (not direct AWS SDK mocks)
-
-            #### clicksign-worker
-            - Clear separation: webhook handler (`lambda_webhook_handler.py`) enqueues and responds fast; SQS worker (`lambda_function.py`) processes
-            - Clicksign API calls isolated in `clicksign_client.py`
-            - Webhook handler validates signature via `CLICKSIGN_WEBHOOK_KEY` where applicable
-            - SQS worker returns `batchItemFailures` for selective retry; don't fail the whole batch
-            - Config exclusively via env vars in `app/config/settings.py`; never hardcoded
-            - Terraform infra in `infra/live/dev/` must accompany changes that require new AWS resources
-            - DTOs/enums/exceptions organized in `app/dto/`, `app/enum/`, `app/exception/`
-
-            ### Tier 1 failure mode analysis (migrations, auth, financial logic)
-            For each Tier 1 change ask:
-            - "What if this fails silently?" → insufficient error handling, fire-and-forget without tracking
-            - "What happens to pre-existing data?" → backward compat breaks, orphaned data, queries missing old states
-            - "Does this work in all envs (dev/staging/prod)?" → hardcoded config, fixed schemas, missing feature flags
-            - "What if this runs twice?" → missing idempotency, duplicates, non-idempotent side effects
-
-            Only generate a finding when the answer reveals a **concrete problem** in the code — no speculative findings.
-
-            ### Cross-commit analysis (PER_COMMIT strategy only)
-            After per-file review:
-            - **DRY cross-commit**: same pattern, dict, helper, or constant introduced in multiple commits
-            - **Approach inconsistency**: same problem solved differently across commits
-            - **Scope drift**: commits that stray from the PR's main theme (INFO — suggest separate PR)
-            - **Evolution regression**: commit N fixes something commit N-1 introduced incorrectly
-
-            ### Reviewer rules
-            - **Flag, don't fix** — report issues and suggest directions; never rewrite the author's code
-            - **Cite evidence** — every finding must reference `file:line`; vague findings are not findings
-            - **Proportionality** — don't nitpick style when there are logic bugs
-            - **Acknowledge quality** — good patterns, clean abstractions, and complete tests deserve recognition
-            - **Zero false positives** — verify each finding against real code; when in doubt, lower severity or note uncertainty
-            - **Author comments are evidence** — if the author contested a finding with code references, verify before carrying it forward
+            ${{ steps.rules.outputs.large_pr }}
 
             ---
 
             ## Phase 3 — Report and Publish
 
-            Format the review as:
+            Format the review using the standard template defined in the loaded output templates:
 
-            ```
-            ## PR Review: {title}
-
-            ### Context
-            - **Repository**: {owner/repo}
-            - **Branch**: {head} → {base}
-            - **Linear**: {ID — title} | "No linked Linear issue"
-            - **Size**: {XS/S/M/L/XL} ({N} lines in {M} files)
-            - **CI Status**: {passing/failing/pending}
-
-            ### Commit Analysis (PER_COMMIT strategy only)
-            | # | Commit | Type | Summary | Observations |
-            |---|--------|------|---------|--------------|
-            | 1 | `{sha[:7]}` | {type} | {message} | {observation or "OK"} |
-
-            **Cross-commit**: {1-2 line summary, or "No cross-commit issues identified"}
-
-            ### Linear Alignment
-            {If issue found: evaluation of adherence to acceptance criteria}
-            {If not found: "No linked issue — review based on code only"}
-
-            ### Positives
-            - {Good practices, clean design, complete tests}
-
-            ### Findings
-
-            #### CRITICAL ({count})
-            - **{file:line}** — {description} — {suggestion}
-
-            #### WARNING ({count})
-            - **{file:line}** — {description} — {suggestion}
-
-            #### INFO ({count})
-            - **{file:line}** — {description} — {suggestion}
-
-            If a section has no findings, include it with "None" to show it was checked.
-
-            ### Stats
-            - Files reviewed: N
-            - Lines changed: +N / -N (size: XS/S/M/L/XL)
-            - Findings: N critical, N warning, N info
-
-            ### Verdict
-            {APPROVE | REQUEST_CHANGES | COMMENT} — {one-line justification}
-            ```
+            ${{ steps.rules.outputs.templates }}
 
             Verdict logic: any CRITICAL → `REQUEST_CHANGES` · no negatives → `APPROVE` · WARNING/INFO only → `COMMENT`
 
