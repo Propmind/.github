@@ -279,7 +279,20 @@ jobs:
                substituting `<owner/repo>` and `<pr_number>` from Run-specific context.
             3. If step 2 also fails, **stop**. Report the error verbatim in your final message. Do **NOT** try `curl`, scripts, sub-agents, or any other tool variant. A failure to publish is acceptable; a retry storm is not.
 
-            Do not ask for confirmation. Publish directly.
+            **After publishing** — if your new verdict is `APPROVE` or `COMMENT`, dismiss any stale `CHANGES_REQUESTED` reviews from this bot on the same PR. GitHub retains all prior reviews; without explicit dismissal, an old `CHANGES_REQUESTED` keeps the PR blocked even when a newer `APPROVE` is posted.
+
+            1. Fetch existing reviews via `mcp__github__get_pull_request_reviews` with the owner/repo and pull_number from Run-specific context.
+            2. Filter to reviews where `user.login` ends with `[bot]` AND `state == "CHANGES_REQUESTED"` AND the review is not already dismissed.
+            3. For each such review, dismiss it:
+               ```
+               gh api repos/<owner/repo>/pulls/<pr_number>/reviews/<review_id>/dismissals \
+                 --method PUT \
+                 --field message="Superseded by new automated review after fixes."
+               ```
+               Use the `review_id` from step 1's output. One `gh api` call per stale review.
+            4. If your new verdict is `REQUEST_CHANGES`, skip dismissal — the previous request stays valid by aggregation.
+
+            Do not ask for confirmation. Publish and dismiss directly.
 
             ---
 
