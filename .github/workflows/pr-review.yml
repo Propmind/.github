@@ -169,6 +169,23 @@ jobs:
             echo "findings=" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Detect stale CHANGES_REQUESTED
+        id: stale
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Pre-check whether any bot-authored CHANGES_REQUESTED reviews are
+          # active on this PR. If none, the dismiss step in Phase 3 is omitted
+          # entirely from the prompt — saves tokens + turns on most reviews.
+          HAS_STALE=$(gh api "repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews" \
+            --jq '[.[] | select(.user.login | endswith("[bot]")) | select(.state == "CHANGES_REQUESTED")] | length' 2>/dev/null || echo "0")
+          if [ "$HAS_STALE" -gt 0 ]; then
+            echo "has_stale=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_stale=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: anthropics/claude-code-action@beta
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -178,129 +195,78 @@ jobs:
           allowed_tools: "mcp__github__create_pull_request_review,Bash(cat:*),Bash(gh api:*)"
           direct_prompt: |
             You are an experienced code reviewer for Propmind (Brazilian real estate SaaS).
-
-            Review the pull request identified in the "Run-specific context" block at the END of this prompt, following the 4-phase process below. The orchestration instructions and rule blocks are byte-identical across runs in the same repo to maximize prompt-cache reuse — keep this in mind when editing.
+            Review PR #${{ inputs.pr_number }} in repository ${{ github.repository }}.
+            ${{ inputs.mode == 'comment' && format('Requested via /review by @{0}.', inputs.comment_author) || '' }}
 
             ---
 
             ## Phase 0 — Detect Context
 
             Run in parallel:
-            - `mcp__github__get_pull_request` — fetch PR metadata (title, body, base, head, author)
-            - `mcp__github__get_pull_request_files` — list of changed files with patches
+            - `mcp__github__get_pull_request` — PR metadata
+            - `mcp__github__get_pull_request_files` — changed files with patches
             - `mcp__github__get_pull_request_status` — CI status
-            - If the run is in `comment` mode (see Run-specific context): also call `mcp__github__get_pull_request_reviews` to check existing reviews and avoid duplicating addressed findings.
+            ${{ inputs.mode == 'comment' && '- `mcp__github__get_pull_request_reviews` — check existing reviews to avoid duplicates' || '' }}
 
-            Extract Linear issue ID from branch name using pattern `[A-Za-z]{2,5}-\d+` (normalize to UPPERCASE).
-            Examples: `fix/pmt-4-charges` → `PMT-4`, `PRO-219/feature` → `PRO-219`.
+            Extract Linear ID from branch with `[A-Za-z]{2,5}-\d+` (UPPERCASE). Ex: `fix/pmt-4-charges` → `PMT-4`.
 
-            **Batch size** — classify by total lines changed (additions + deletions):
-            | Size | Lines | Action |
-            |---|---|---|
-            | XS | < 50 | No note |
-            | S | 50–200 | No note |
-            | M | 200–500 | Healthy range |
-            | L | 500–1000 | Emit WARNING suggesting where to split |
-            | XL | 1000+ | Make batch size the **main finding** — defect detection drops to ~28%; focus on how to decompose |
+            **Batch size** by total lines changed: XS <50 / S 50–200 / M 200–500 / L 500–1000 (WARNING suggesting split) / XL 1000+ (batch size = main finding, defect detection ~28%).
 
-            **Read strategy:**
-            - `SINGLE_DIFF` for XS/S or ≤ 2 commits
-            - `PER_COMMIT` for M+ with 3+ well-structured commits
-            - `SINGLE_DIFF + INFO` for messy commits
+            **Read strategy:** `SINGLE_DIFF` for XS/S or ≤2 commits · `PER_COMMIT` for M+ with 3+ structured commits · `SINGLE_DIFF + INFO` for messy commits.
 
             ---
 
             ## Phase 1 — Gather
 
             Run in parallel:
-            - **Convention docs**: read each path listed in "Convention docs" (see Run-specific context, comma-separated, relative to repo root). These are the **sole authority** for convention violations — only flag rules explicitly documented in these files.
-            - **Linear context**: if a Linear ID was found, call `mcp__linear__linear_get_issue` with the identifier to get title, description, and acceptance criteria.
-            - **PR discussion**: fetch the issue comments for this PR (via `mcp__github__get_pull_request` already includes comments, or use the issue comments endpoint with the PR number from Run-specific context) to extract author contests of prior findings.
+            - **Convention docs** (sole authority for violations — only flag rules documented here): ${{ inputs.convention_docs }}
+            - **Linear**: if ID found, call `mcp__linear__linear_get_issue`.
+            - **PR comments**: `gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments` for author contests of prior findings.
 
-            For L/XL PRs apply risk-based file prioritization (see "Risk-based file prioritization" in the rule blocks below).
-
-            For `PER_COMMIT` strategy: read the consolidated diff first. Only inspect an individual commit when the consolidated diff has ambiguous intent for a hunk (e.g., adjacent additions and deletions that may be a refactor or a rewrite). Do not pre-read every commit before the consolidated.
+            For L/XL PRs apply risk-based file prioritization (see below).
+            For `PER_COMMIT`: read consolidated diff first; consult individual commits only when intent is ambiguous.
 
             ---
 
             ## Phase 2 — Analyze
 
-            Severity scale: **CRITICAL** (blocks merge) · **WARNING** (recommended fix) · **INFO** (suggestion)
+            Severity: **CRITICAL** (blocks) · **WARNING** (recommended) · **INFO** (suggestion).${{ inputs.service_type != '' && format(' Service type: **{0}**.', inputs.service_type) || '' }}
 
-            The authoritative review rules for this run are loaded from `Propmind/.github/review-pr-rules/`:
-
-            ### Common rules
+            Authoritative rules from `Propmind/.github/review-pr-rules/`:
 
             ${{ steps.rules.outputs.common }}
 
-            ### Project-specific rules
-
             ${{ steps.rules.outputs.project }}
 
-            ### Risk-based file prioritization (apply when batch size is L or XL)
+            ### Risk-based file prioritization (L/XL only)
 
             ${{ steps.rules.outputs.large_pr }}
-
+            ${{ steps.semgrep.outputs.count != '' && steps.semgrep.outputs.count != '0' && format('
             ### Deterministic findings (semgrep pre-pass)
 
-            The following findings were emitted by the caller repo's `.semgrep/propmind-conventions.yml` against the diff since `main`:
+            {0}
 
-            ${{ steps.semgrep.outputs.count != '' && steps.semgrep.outputs.count != '0' && steps.semgrep.outputs.findings || '(no new violations of deterministic conventions)' }}
-
-            **These findings are AUTHORITATIVE.** Include them verbatim in your `Findings` section under the appropriate severity:
-            - `propmind.backend.session-mutation-without-commit` → CRITICAL
-            - All other `propmind.*` rule IDs → use the severity from the semgrep output line above
-            **Do NOT re-emit equivalent findings from your own analysis** — your job is to find issues these deterministic rules cannot catch.
+            **AUTHORITATIVE — include verbatim in `Findings`.** Severity: `propmind.backend.session-mutation-without-commit` → CRITICAL; others → use the listed severity. Do NOT re-emit these from your own analysis.', steps.semgrep.outputs.findings) || '' }}
 
             ---
 
             ## Phase 3 — Report and Publish
 
-            Format the review using the standard template defined in the loaded output templates:
+            Format using:
 
             ${{ steps.rules.outputs.templates }}
 
-            Verdict logic: any CRITICAL → `REQUEST_CHANGES` · no negatives → `APPROVE` · WARNING/INFO only → `COMMENT`
+            Verdict: any CRITICAL → `REQUEST_CHANGES` · no negatives → `APPROVE` · WARNING/INFO only → `COMMENT`.
 
-            **Publish using this deterministic sequence — do NOT deviate:**
+            **Publish — do NOT deviate:**
 
-            1. Try `mcp__github__create_pull_request_review` with:
-               - `owner` and `repo` extracted from the repo identifier in Run-specific context
-               - `pull_number`: the PR number from Run-specific context
-               - `body`: the formatted review
-               - `event`: `REQUEST_CHANGES` / `APPROVE` / `COMMENT` per verdict logic above
-            2. If step 1 fails with a body-size or escaping error, write the body to `/tmp/pr_review.md` using a single `cat <<'REVIEW_EOF' > /tmp/pr_review.md` HEREDOC (quoted sentinel to prevent shell expansion), then publish via:
-               ```
-               gh api repos/<owner/repo>/pulls/<pr_number>/reviews \
-                 --method POST \
-                 --field event="<event>" \
-                 --field "body=@/tmp/pr_review.md"
-               ```
-               substituting `<owner/repo>` and `<pr_number>` from Run-specific context.
-            3. If step 2 also fails, **stop**. Report the error verbatim in your final message. Do **NOT** try `curl`, scripts, sub-agents, or any other tool variant. A failure to publish is acceptable; a retry storm is not.
+            1. Try `mcp__github__create_pull_request_review` with owner/repo from `${{ github.repository }}`, pull_number `${{ inputs.pr_number }}`, body, event.
+            2. On body-size/escaping error: write body to `/tmp/pr_review.md` via `cat <<'REVIEW_EOF' > /tmp/pr_review.md` HEREDOC (quoted sentinel), then `gh api repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews --method POST --field event="<event>" --field "body=@/tmp/pr_review.md"`.
+            3. On any further failure: **stop**, report the error verbatim. No `curl`, scripts, sub-agents, or other variants.
+            ${{ steps.stale.outputs.has_stale == 'true' && format('
+            **Dismiss stale CHANGES_REQUESTED.** This PR has a prior bot `CHANGES_REQUESTED` review still active. If your new verdict is `APPROVE` or `COMMENT`:
+            1. Fetch reviews via `mcp__github__get_pull_request_reviews`.
+            2. For each review where `user.login` ends with `[bot]` AND `state == "CHANGES_REQUESTED"`, dismiss it: `gh api repos/{0}/pulls/{1}/reviews/<review_id>/dismissals --method PUT --field message="Superseded by new automated review."` (one call per stale review).
+            3. Skip dismissal if your verdict is `REQUEST_CHANGES`.', github.repository, inputs.pr_number) || '' }}
 
-            **After publishing** — if your new verdict is `APPROVE` or `COMMENT`, dismiss any stale `CHANGES_REQUESTED` reviews from this bot on the same PR. GitHub retains all prior reviews; without explicit dismissal, an old `CHANGES_REQUESTED` keeps the PR blocked even when a newer `APPROVE` is posted.
-
-            1. Fetch existing reviews via `mcp__github__get_pull_request_reviews` with the owner/repo and pull_number from Run-specific context.
-            2. Filter to reviews where `user.login` ends with `[bot]` AND `state == "CHANGES_REQUESTED"` AND the review is not already dismissed.
-            3. For each such review, dismiss it:
-               ```
-               gh api repos/<owner/repo>/pulls/<pr_number>/reviews/<review_id>/dismissals \
-                 --method PUT \
-                 --field message="Superseded by new automated review after fixes."
-               ```
-               Use the `review_id` from step 1's output. One `gh api` call per stale review.
-            4. If your new verdict is `REQUEST_CHANGES`, skip dismissal — the previous request stays valid by aggregation.
-
-            Do not ask for confirmation. Publish and dismiss directly.
-
-            ---
-
-            ## Run-specific context
-
-            - **Repository**: ${{ github.repository }}
-            - **Pull request number**: ${{ inputs.pr_number }}
-            - **Run mode**: ${{ inputs.mode }}${{ inputs.mode == 'comment' && format(' — review requested via /review comment by @{0}', inputs.comment_author) || '' }}
-            - **Service type hint**: ${{ inputs.service_type != '' && inputs.service_type || '(none — infer from code)' }}
-            - **Convention docs** (comma-separated paths from caller workflow):
-              ${{ inputs.convention_docs }}
+            Publish directly — no confirmation.
