@@ -1,13 +1,11 @@
 # Project — `api` (propmind-core/api)
 
-## Phase 2 checklist
-
-- Route → Resource → Validator pattern respected
-- `get_session_context()` does **not** auto-commit — resource functions that mutate ORM state must call `await session.commit()` explicitly before returning (and `await session.refresh(obj)` when the return value reads from ORM attributes). Missing commit → 200 OK with identity map masking the bug → silent write loss. See `propmind-core/api/AGENTS.md` "Session commits are explicit"
-- Validators called before any data mutation
-- Pydantic schemas for request/response
-- Security dependencies on routes (`RequireAuth`, `RequireAdmin`, `RequireAdminOrOperation`, `RequireAgency`)
-- Tests in `tests/unit/`, `tests/integration/`, `tests/e2e/` with pytest markers
-- Private validator methods (e.g. `_validate_x`) must be called from the public method (`validate()`); grep to confirm call site — method without call site is dead code
-- Double-write: if a factory/service call already persists a field on the returned object, don't set it again; one write only
-- Validator tests must call the **public method** (`validate()`), not private methods directly — testing a private method in isolation doesn't prove wiring
+- Route → Resource → Validator pattern respected.
+- `get_session_context()` does NOT auto-commit. Resource functions that mutate ORM state must call `await session.commit()` before returning (and `await session.refresh(obj)` if reading ORM attrs after). Missing commit = silent write loss. See `api/AGENTS.md` "Session commits are explicit". (Semgrep already catches `session.add/delete` without commit; flag other write paths like `session.execute(update(...))`.)
+- Validators called before any data mutation.
+- Pydantic schemas for request/response.
+- Security deps on routes: `RequireAuth`, `RequireAdmin`, `RequireAdminOrOperation`, `RequireAgency`.
+- Tests in `tests/unit/`, `tests/integration/`, `tests/e2e/` with pytest markers (semgrep checks marker presence).
+- Private validator methods (`_validate_x`) must be called from public `validate()`. Grep call site; if absent, it's dead code.
+- Double-write: don't set a field both inside a factory/service call AND on the returned object — pick one.
+- Validator tests call the **public** `validate()`, not private methods directly.
