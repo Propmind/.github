@@ -212,7 +212,7 @@ jobs:
 
             **Batch size** by total lines changed: XS <50 / S 50–200 / M 200–500 / L 500–1000 (WARNING suggesting split) / XL 1000+ (batch size = main finding, defect detection ~28%).
 
-            **Read strategy:** `SINGLE_DIFF` for XS/S or ≤2 commits · `PER_COMMIT` for M+ with 3+ structured commits · `SINGLE_DIFF + INFO` for messy commits.
+            **Read strategy:** `SINGLE_DIFF` for XS/S or ≤2 commits or messy commits · `PER_COMMIT` for M+ with 3+ well-structured commits.
 
             ---
 
