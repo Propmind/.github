@@ -38,13 +38,10 @@ Format the published review exactly as:
 #### WARNING (<count>)
 - **<file:line>** — <description> — <suggestion>
 
-#### INFO (<count>)
-- **<file:line>** — <description> — <suggestion>
-
 ### Stats
 - Files reviewed: N
 - Lines changed: +N / -N (size: XS/S/M/L/XL)
-- Findings: N critical, N warning, N info
+- Findings: N critical, N warning
 
 ### Verdict
 <APPROVE | REQUEST_CHANGES | COMMENT> — <one-line justification>

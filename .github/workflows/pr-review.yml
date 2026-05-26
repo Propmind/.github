@@ -228,9 +228,21 @@ jobs:
 
             ---
 
-            ## Phase 2 — Analyze
+            ## Phase 2 — Analyze${{ inputs.service_type != '' && format(' (Service type: **{0}**)', inputs.service_type) || '' }}
 
-            Severity: **CRITICAL** (blocks) · **WARNING** (recommended) · **INFO** (suggestion).${{ inputs.service_type != '' && format(' Service type: **{0}**.', inputs.service_type) || '' }}
+            **Strict finding contract — only emit findings that match:**
+
+            - **CRITICAL** — security issues, data loss/corruption, broken API or contract, race conditions, bugs that will fail at runtime, missing auth on sensitive routes.
+            - **WARNING** — likely bug or missing error handling with a clear path to failure in production, documented convention violation with concrete cost.
+
+            **Do NOT emit findings for:**
+
+            - Style, formatting, naming preferences, code aesthetics.
+            - "I'd do it differently" — taste opinions without a concrete failure mode.
+            - Theoretical/hypothetical issues with no realistic trigger.
+            - Verbose suggestions, "nice to have", or refactor opportunities unrelated to the change.
+
+            If the diff has no CRITICAL or WARNING findings that meet this bar, emit a clean APPROVE. A review that flags everything gets muted by devs in a week.
 
             Authoritative rules from `Propmind/.github/review-pr-rules/`:
 
@@ -256,7 +268,7 @@ jobs:
 
             ${{ steps.rules.outputs.templates }}
 
-            Verdict: any CRITICAL → `REQUEST_CHANGES` · no negatives → `APPROVE` · WARNING/INFO only → `COMMENT`.
+            Verdict: any CRITICAL → `REQUEST_CHANGES` · WARNING only → `COMMENT` · neither → `APPROVE`.
 
             **Publish — do NOT deviate:**
 
