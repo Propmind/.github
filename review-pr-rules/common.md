@@ -29,13 +29,11 @@ Loaded for every review.
 
 ## Cross-commit analysis (PER_COMMIT only)
 
-Apply after per-file review:
+Apply after per-file review. Only flag as WARNING when the inconsistency has a concrete cost (maintenance burden, bug risk, broken contract). Skip if it's just process noise.
 
 - **DRY cross-commit** — same pattern/helper/constant duplicated across commits.
 - **Approach inconsistency** — same problem solved differently across commits.
-- **Scope drift** — commits stray from PR theme (INFO; suggest split).
-- **Evolution regression** — commit N fixes something commit N-1 introduced wrong (context, not a finding by itself).
-- **PR body vs reality** — described changes absent, or present but undescribed (INFO).
+- **Evolution regression** — commit N fixes something commit N-1 introduced wrong (context for scrutiny, not a standalone finding).
 
 ## Failure mode analysis (Tier 1 files only)
 
