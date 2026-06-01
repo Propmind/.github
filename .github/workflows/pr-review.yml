@@ -53,6 +53,38 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Route model by PR size
+        id: route
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Sonnet 4.6 is overkill for XS/S PRs (< 200 lines changed). Route
+          # those to Haiku 4.5 (73% cheaper input). M+ PRs keep Sonnet —
+          # they need the stronger reasoning for cross-file logic.
+          # Caller can override by passing a non-default `model` input.
+          STATS=$(gh pr view ${{ inputs.pr_number }} -R ${{ github.repository }} \
+                    --json additions,deletions 2>/dev/null || echo '{"additions":0,"deletions":0}')
+          ADDS=$(echo "$STATS" | jq -r '.additions // 0')
+          DELS=$(echo "$STATS" | jq -r '.deletions // 0')
+          TOTAL=$((ADDS + DELS))
+
+          if [ "${{ inputs.model }}" != "claude-sonnet-4-6" ]; then
+            # Caller explicitly chose a model — respect it.
+            CHOSEN="${{ inputs.model }}"
+            REASON="explicit caller override"
+          elif [ "$TOTAL" -lt 200 ]; then
+            CHOSEN="claude-haiku-4-5"
+            REASON="XS/S size ($TOTAL lines) routed to Haiku"
+          else
+            CHOSEN="claude-sonnet-4-6"
+            REASON="M+ size ($TOTAL lines) routed to Sonnet"
+          fi
+
+          echo "model=$CHOSEN" >> "$GITHUB_OUTPUT"
+          echo "size_lines=$TOTAL" >> "$GITHUB_OUTPUT"
+          echo "🤖 Model: $CHOSEN — $REASON" >&2
+
       - name: Check Linear availability
         id: check-linear
         env:
@@ -190,7 +222,7 @@ jobs:
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          model: ${{ inputs.model }}
+          model: ${{ steps.route.outputs.model }}
           mcp_config: ${{ steps.check-linear.outputs.available == 'true' && steps.mcp-config.outputs.config || '' }}
           allowed_tools: "mcp__github__create_pull_request_review,Bash(cat:*),Bash(gh api:*)"
           direct_prompt: |
