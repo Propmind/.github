@@ -307,7 +307,7 @@ jobs:
 
             Run in parallel:
             - **Convention docs** (sole authority for violations — only flag rules documented here): ${{ inputs.convention_docs }}
-            - **Linear**: ${{ steps.linear.outputs.found == 'true' && 'the issue is inlined below — there is no Linear tool to call, and no other source. Use it for the Linear Alignment section.' || 'no issue was resolved for this branch. Write "No linked issue — review based on code only" and do NOT infer acceptance criteria from the branch name or the PR body.' }}
+            - **Linear**: ${{ steps.linear.outputs.found == 'true' && 'the issue is inlined below — there is no Linear tool to call, and no other source. Use it for the Linear Alignment section.' || 'no issue was resolved for this branch. Write "No linked issue — review based on code only" in the Linear Alignment section, and do not present anything as an acceptance criterion. The PR description and the branch name remain valid context for intent — just never quoted as requirements.' }}
             - **PR comments**: `gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments` for author contests of prior findings.
 
             For L/XL PRs apply risk-based file prioritization (see below).
