@@ -99,6 +99,12 @@ jobs:
       - name: Fetch Linear issue
         if: steps.check-linear.outputs.available == 'true'
         id: linear
+        # This step must never be able to fail the review. It reaches the network
+        # and parses a payload it does not control; anything unforeseen in here
+        # would otherwise turn the `Review PR` check red on every PR of every repo
+        # that calls this workflow. On failure `found` is simply never written and
+        # the prompt falls through to "no linked issue" — today's behaviour.
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
@@ -110,7 +116,7 @@ jobs:
           # ever having read the issue. One GraphQL call needs no package, no npx,
           # and no tool permission — and it either works or says so out loud.
           BRANCH=$(gh pr view "${{ inputs.pr_number }}" -R "${{ github.repository }}" \
-                     --json headRefName --jq .headRefName)
+                     --json headRefName --jq .headRefName 2>/dev/null || true)
           ISSUE_ID=$(printf '%s' "$BRANCH" \
                      | grep -oiE '[A-Za-z]{2,5}-[0-9]+' \
                      | head -1 | tr '[:lower:]' '[:upper:]' || true)
@@ -134,21 +140,27 @@ jobs:
             -H "Content-Type: application/json" \
             -d "$QUERY" || echo '{}')
 
-          ISSUE=$(echo "$RESPONSE" | jq -c '.data.issues.nodes[0] // empty')
+          ISSUE=$(echo "$RESPONSE" | jq -c '.data.issues.nodes[0] // empty' 2>/dev/null || true)
           if [ -z "$ISSUE" ]; then
             echo "found=false" >> "$GITHUB_OUTPUT"
             echo "::warning::Linear lookup for $ISSUE_ID returned nothing: $(echo "$RESPONSE" | jq -rc '.errors // "no data"')"
             exit 0
           fi
 
-          # Guard the heredoc sentinel: an issue description containing the
-          # delimiter on its own line would otherwise forge workflow outputs.
+          # Truncate inside jq rather than piping through `head`: `head` closes the
+          # pipe early on a long description, `grep` dies of SIGPIPE, and pipefail
+          # would abort the block before the closing delimiter is written — leaving
+          # `found=true` next to an empty context.
+          # The `grep` guards the sentinel: a description carrying the delimiter on
+          # a line of its own would otherwise forge workflow outputs.
+          CONTEXT=$(echo "$ISSUE" | jq -r '
+            "**\(.identifier) — \(.title)** · state: \(.state.name) · \(.url)\n\n\((.description // "(no description)")[0:6000])"' \
+            | { grep -vx 'LINEAR_ISSUE_EOF' || true; })
+
           {
             echo "found=true"
             echo "context<<LINEAR_ISSUE_EOF"
-            echo "$ISSUE" | jq -r '
-              "**\(.identifier) — \(.title)** · state: \(.state.name) · \(.url)\n\n\(.description // "(no description)")"' \
-              | { grep -vx 'LINEAR_ISSUE_EOF' || true; }
+            printf '%s\n' "$CONTEXT"
             echo "LINEAR_ISSUE_EOF"
           } >> "$GITHUB_OUTPUT"
           echo "::notice::Linear $ISSUE_ID loaded."
