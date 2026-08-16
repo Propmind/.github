@@ -96,27 +96,62 @@ jobs:
             echo "available=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Create MCP config
+      - name: Fetch Linear issue
         if: steps.check-linear.outputs.available == 'true'
-        id: mcp-config
+        id: linear
         env:
+          GH_TOKEN: ${{ github.token }}
           LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
         run: |
-          CONFIG=$(python3 -c "
-          import json, os
-          config = {
-            'mcpServers': {
-              'linear': {
-                'type': 'stdio',
-                'command': 'npx',
-                'args': ['-y', '@linear/mcp-server'],
-                'env': {'LINEAR_API_KEY': os.environ['LINEAR_API_KEY']}
-              }
-            }
-          }
-          print(json.dumps(config))
-          ")
-          echo "config=$CONFIG" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          # This used to start an MCP server from `@linear/mcp-server`, a package
+          # that does not exist on npm. Every run logged `"linear": "failed"` and
+          # the review's "Linear Alignment" section was written without the agent
+          # ever having read the issue. One GraphQL call needs no package, no npx,
+          # and no tool permission — and it either works or says so out loud.
+          BRANCH=$(gh pr view "${{ inputs.pr_number }}" -R "${{ github.repository }}" \
+                     --json headRefName --jq .headRefName)
+          ISSUE_ID=$(printf '%s' "$BRANCH" \
+                     | grep -oiE '[A-Za-z]{2,5}-[0-9]+' \
+                     | head -1 | tr '[:lower:]' '[:upper:]' || true)
+
+          if [ -z "$ISSUE_ID" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No Linear identifier in branch '$BRANCH' — reviewing on code alone."
+            exit 0
+          fi
+
+          # Look the issue up by team key + number rather than by `issue(id:)`,
+          # which wants a UUID. `PMT-1666` → team `PMT`, number `1666`.
+          TEAM_KEY=${ISSUE_ID%-*}
+          ISSUE_NUM=${ISSUE_ID##*-}
+          QUERY=$(jq -n --arg team "$TEAM_KEY" --argjson number "$ISSUE_NUM" '{
+            query: "query($team:String!,$number:Float!){issues(filter:{team:{key:{eq:$team}},number:{eq:$number}},first:1){nodes{identifier title description url state{name}}}}",
+            variables: {team: $team, number: $number}
+          }')
+          RESPONSE=$(curl -sS --max-time 30 -X POST https://api.linear.app/graphql \
+            -H "Authorization: $LINEAR_API_KEY" \
+            -H "Content-Type: application/json" \
+            -d "$QUERY" || echo '{}')
+
+          ISSUE=$(echo "$RESPONSE" | jq -c '.data.issues.nodes[0] // empty')
+          if [ -z "$ISSUE" ]; then
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::Linear lookup for $ISSUE_ID returned nothing: $(echo "$RESPONSE" | jq -rc '.errors // "no data"')"
+            exit 0
+          fi
+
+          # Guard the heredoc sentinel: an issue description containing the
+          # delimiter on its own line would otherwise forge workflow outputs.
+          {
+            echo "found=true"
+            echo "context<<LINEAR_ISSUE_EOF"
+            echo "$ISSUE" | jq -r '
+              "**\(.identifier) — \(.title)** · state: \(.state.name) · \(.url)\n\n\(.description // "(no description)")"' \
+              | { grep -vx 'LINEAR_ISSUE_EOF' || true; }
+            echo "LINEAR_ISSUE_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "::notice::Linear $ISSUE_ID loaded."
 
       - name: Load review rules from Propmind/.github
         id: rules
@@ -223,12 +258,20 @@ jobs:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
           model: ${{ steps.route.outputs.model }}
-          mcp_config: ${{ steps.check-linear.outputs.available == 'true' && steps.mcp-config.outputs.config || '' }}
-          allowed_tools: "mcp__github__create_pull_request_review,Bash(cat:*),Bash(gh api:*)"
+          # Phase 0 asks for the four read tools below. They were absent here, so
+          # every run burned turns on denied calls before falling back to `gh api`.
+          allowed_tools: "mcp__github__get_pull_request,mcp__github__get_pull_request_files,mcp__github__get_pull_request_status,mcp__github__get_pull_request_reviews,mcp__github__create_pull_request_review,Bash(cat:*),Bash(gh api:*)"
           direct_prompt: |
             You are an experienced code reviewer for Propmind (Brazilian real estate SaaS).
             Review PR #${{ inputs.pr_number }} in repository ${{ github.repository }}.
             ${{ inputs.mode == 'comment' && format('Requested via /review by @{0}.', inputs.comment_author) || '' }}
+
+            **Never `Read` a path under `/tmp/github-images/`.** Those files are staged
+            by this action, not by the PR author — one of them is the action's own
+            "Claude Code is working…" progress spinner, an animated GIF saved with a
+            `.png` extension. Reading it sends a GIF declared as PNG to the API and the
+            whole run dies on a 400. Nothing there is PR content; ignore every `<img>`
+            pointing at that directory.
 
             ---
 
@@ -252,11 +295,16 @@ jobs:
 
             Run in parallel:
             - **Convention docs** (sole authority for violations — only flag rules documented here): ${{ inputs.convention_docs }}
-            - **Linear**: if ID found, call `mcp__linear__linear_get_issue`.
+            - **Linear**: ${{ steps.linear.outputs.found == 'true' && 'the issue is inlined below — there is no Linear tool to call, and no other source. Use it for the Linear Alignment section.' || 'no issue was resolved for this branch. Write "No linked issue — review based on code only" and do NOT infer acceptance criteria from the branch name or the PR body.' }}
             - **PR comments**: `gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments` for author contests of prior findings.
 
             For L/XL PRs apply risk-based file prioritization (see below).
             For `PER_COMMIT`: read consolidated diff first; consult individual commits only when intent is ambiguous.
+            ${{ steps.linear.outputs.found == 'true' && format('
+            ### Linked Linear issue
+
+            {0}
+            ', steps.linear.outputs.context) || '' }}
 
             ---
 
