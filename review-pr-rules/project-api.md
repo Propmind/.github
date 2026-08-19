@@ -1,6 +1,18 @@
 # Project — `api` (propmind-core/api)
 
 - Route → Resource → Validator pattern respected.
+- **Band placement.** `api` code is separated into bands, each defined by what it may *not* import — `routes/`, `resources/`, `resource_validators/`, `services/`, `domain/`, `repositories/`, `db/models/`, `integrations/`, `composition/`. Source of truth: `api/AGENTS.md` → *"Which band does this belong to?"* and *"Layer boundaries — enforced in CI"*. Emit a WARNING when the diff files code in the wrong band, and name the concrete cost:
+  - a read (a function that only asks questions) written outside `repositories/`, or a read that does not take `session` as its first parameter;
+  - a `repositories/` function raising `HTTPException` or deciding that absence is a 404 — reads return `| None` (`_find_*`) and the caller decides;
+  - a read imported from the `repositories/` package instead of from its module (`from repositories.financial.charges import ...`); the package files are docstring-only and `tests/unit/test_repositories_package_surface.py` keeps them that way;
+  - a guard's query (query + reject with `HTTPException`) left inline in a resource instead of `resource_validators/` — a query buried in a guard is invisible to the read layer, so a cross-cutting filter never reaches it;
+  - `get_session_context()` opened inside a `services/` module — `resources/` owns the transaction (application service), `services/` receives a session (domain service); a session opened in `services/` is a use case in the wrong band;
+  - a `domain/` module importing `db`, `db.models`, `sqlalchemy`, `fastapi`, `resources`, `routes`, `services`, `integrations` or `resource_validators` — a rule takes facts, never rows;
+  - a `db/models/` `@property` or `@validates` that calls a service or reaches a resource — that starts a cycle;
+  - an `integrations/` module importing `resources`, `routes` or `services`, or a concrete adapter constructed anywhere but `composition/`.
+- **A new band — or an existing one that becomes a destination for code from another band — ships its import contract in the same PR** (`api/pyproject.toml`, `[tool.importlinter]`). A PR that lifts code into a still-unfenced layer and defers the contract is a WARNING; this has been missed three times (see `api/AGENTS.md`). The contract must have been watched failing on a planted violation, not merely added.
+- **`lint-imports` (`Layer boundaries`) is a required check on `main`.** If the check is red, the broken contract is the CRITICAL finding and the fix is to remove the dependency, not to armour the contract with `allow_indirect_imports` — that flag is only correct when the transitive path *is* the design (`routes → resources → repositories`). Don't restate CI output the author already sees; report it once.
+- **Decomposition posture (do not turn this into noise).** A new feature is expected to go in decomposed by band. An adjustment or improvement to existing code is a cost/benefit call by the author, so **do not demand decomposition of pre-existing single-band code that the PR merely touches** — that is out of scope per the finding contract. Raise it only when the diff itself adds a new concern to an already mixed function, and say what the added concern is.
 - `get_session_context()` does NOT auto-commit. Resource functions that mutate ORM state must call `await session.commit()` before returning (and `await session.refresh(obj)` if reading ORM attrs after). Missing commit = silent write loss. See `api/AGENTS.md` "Session commits are explicit". (Semgrep already catches `session.add/delete` without commit; flag other write paths like `session.execute(update(...))`.)
 - Validators called before any data mutation.
 - Pydantic schemas for request/response.
