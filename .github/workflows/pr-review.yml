@@ -180,6 +180,7 @@ jobs:
             Propmind/boleto-extractor) FRAGMENT="project-boleto-extractor" ;;
             Propmind/consumer-baas) FRAGMENT="project-consumer-baas" ;;
             Propmind/clicksign-worker) FRAGMENT="project-clicksign-worker" ;;
+            Propmind/propmind-nfse-emitter) FRAGMENT="project-nfse-emitter" ;;
             *) FRAGMENT="" ;;
           esac
 
