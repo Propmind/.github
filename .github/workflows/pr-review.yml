@@ -29,7 +29,7 @@ on:
       model:
         required: false
         type: string
-        default: "claude-sonnet-5"
+        default: "claude-opus-5-5"
         description: "Claude model to use for the review"
       max_turns:
         required: false
@@ -203,20 +203,22 @@ jobs:
         id: route
         run: |
           set -euo pipefail
-          # Sonnet is overkill for XS/S PRs (< 200 lines changed). Route those to
-          # Haiku. Size excludes lockfiles and generated files, so a small change
-          # that bumps a dependency no longer lands on the expensive model.
+          # M+ PRs go to Opus 5.5: in replays of already-reviewed PRs it found
+          # more of the known findings than Sonnet 5 and cost less per review
+          # (fewer turns outweigh the higher token price). XS/S PRs (< 200 lines)
+          # go to Haiku. Size excludes lockfiles and generated files, so a small
+          # change that bumps a dependency no longer lands on the larger model.
           # Caller can override by passing a non-default `model` input.
           TOTAL=${{ steps.context.outputs.size_lines }}
-          if [ "${{ inputs.model }}" != "claude-sonnet-5" ]; then
+          if [ "${{ inputs.model }}" != "claude-opus-5-5" ]; then
             CHOSEN="${{ inputs.model }}"
             REASON="explicit caller override"
           elif [ "$TOTAL" -lt 200 ]; then
             CHOSEN="claude-haiku-4-5"
             REASON="XS/S size ($TOTAL lines) routed to Haiku"
           else
-            CHOSEN="claude-sonnet-5"
-            REASON="M+ size ($TOTAL lines) routed to Sonnet"
+            CHOSEN="claude-opus-5-5"
+            REASON="M+ size ($TOTAL lines) routed to Opus"
           fi
           echo "model=$CHOSEN" >> "$GITHUB_OUTPUT"
           echo "🤖 Model: $CHOSEN — $REASON" >&2
