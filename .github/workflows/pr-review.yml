@@ -40,7 +40,12 @@ on:
         required: false
         type: boolean
         default: false
-        description: "Validation mode: write the review to the step summary instead of the PR, and hide the bot's previous review from the reviewer."
+        description: "Validation mode: write the review to the step summary instead of the PR, and hide the PR discussion and the bot's previous review from the reviewer."
+      head_sha:
+        required: false
+        type: string
+        default: ""
+        description: "Dry run only: review this commit instead of the PR head, to replay the exact state an earlier review saw."
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -68,7 +73,7 @@ jobs:
       # instead of the code under review.
       - uses: actions/checkout@v4
         with:
-          ref: refs/pull/${{ inputs.pr_number }}/head
+          ref: ${{ inputs.dry_run && inputs.head_sha || format('refs/pull/{0}/head', inputs.pr_number) }}
           fetch-depth: 0
 
       # Everything the agent used to fetch with tool calls in its first turns is
@@ -84,7 +89,7 @@ jobs:
           mkdir -p "$CONTEXT_DIR"
 
           gh pr view "$PR_NUMBER" -R "$REPO" \
-            --json number,title,body,url,author,headRefName,baseRefName,headRefOid,commits \
+            --json number,title,body,url,author,headRefName,baseRefName \
             > "$CONTEXT_DIR/pr.json"
           BASE=$(jq -r .baseRefName "$CONTEXT_DIR/pr.json")
           # Diff against the base commit GitHub records for the PR, not the base
@@ -159,18 +164,21 @@ jobs:
             fi
             echo
             echo "## Commits"
-            jq -r '.commits[] | "- `\(.oid[0:7])` \(.messageHeadline)"' "$CONTEXT_DIR/pr.json"
+            # shellcheck disable=SC2016 # the backticks are Markdown, not expansion
+            git log --reverse --no-merges --format='- `%h` %s' "$BASE_REF..HEAD"
             echo
             echo "## Description"
             jq -r '(.body // "(empty)")[0:8000]' "$CONTEXT_DIR/pr.json"
           } > "$CONTEXT_DIR/pr.md"
 
           # Human discussion, so the reviewer can honour contested findings, plus
-          # the bot's previous review so it does not repeat itself.
+          # the bot's previous review so it does not repeat itself. A dry run
+          # hides it: it replays a past state, and later comments would leak how
+          # the earlier review's findings turned out.
           {
             echo "# Discussion on PR #$PR_NUMBER"
             echo
-            gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+            [ "${{ inputs.dry_run }}" = "true" ] && echo "(hidden in dry run)" || gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
               --jq '.[] | select(.user.type != "Bot") | "### @\(.user.login) — \(.created_at)\n\n\(.body[0:3000])\n"' \
               | tail -c 60000 || true
             if [ -s "$CONTEXT_DIR/last-bot-review.json" ]; then
@@ -533,6 +541,7 @@ jobs:
           COST=$(echo "$RESULT" | jq -r '(.total_cost_usd // 0) * 100 | round / 100')
           DENIALS=$(echo "$RESULT" | jq -r '(.permission_denials // []) | length')
           SUBTYPE=$(echo "$RESULT" | jq -r '.subtype // "?"')
+          DENIED=$(echo "$RESULT" | jq -r '(.permission_denials // [])[] | "\(.tool_name): \((.tool_input.command // .tool_input.file_path // .tool_input.pattern // "") | tostring | .[0:80])"')
           echo "::notice::review-usage model=$MODEL size=$SIZE turns=$TURNS cost_usd=$COST denials=$DENIALS result=$SUBTYPE"
           {
             echo "### Review usage"
@@ -540,4 +549,11 @@ jobs:
             echo "| Model | Size (lines) | Turns | Cost (USD) | Denied tool calls | Result |"
             echo "|---|---|---|---|---|---|"
             echo "| $MODEL | $SIZE | $TURNS | $COST | $DENIALS | $SUBTYPE |"
+            if [ -n "$DENIED" ]; then
+              echo
+              echo "Denied tool calls:"
+              echo
+              while IFS= read -r D; do echo "- \`$D\`"; done <<< "$DENIED"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r D; do [ -n "$D" ] && echo "::notice::review-denied $D"; done <<< "$DENIED"
