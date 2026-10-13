@@ -87,7 +87,15 @@ jobs:
             --json number,title,body,url,author,headRefName,baseRefName,headRefOid,commits \
             > "$CONTEXT_DIR/pr.json"
           BASE=$(jq -r .baseRefName "$CONTEXT_DIR/pr.json")
-          git fetch --no-tags --quiet origin "+refs/heads/$BASE:refs/remotes/origin/$BASE"
+          # A stacked PR's base branch may already be gone (deleted after its own
+          # merge); fall back to the base commit GitHub recorded for the PR.
+          if git fetch --no-tags --quiet origin "+refs/heads/$BASE:refs/remotes/origin/$BASE" 2>/dev/null; then
+            BASE_REF="origin/$BASE"
+          else
+            BASE_REF=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .base.sha)
+            git fetch --no-tags --quiet origin "$BASE_REF"
+            echo "::warning::Base branch '$BASE' not found; diffing against base commit ${BASE_REF:0:7}."
+          fi
 
           # Lockfiles, snapshots and build output carry no reviewable logic. They
           # stay out of the diff and out of the size that picks the model.
@@ -100,7 +108,7 @@ jobs:
             ':(exclude,glob)**/*.min.js' ':(exclude,glob)**/*.min.css'
             ':(exclude,glob)**/dist/**' ':(exclude,glob)**/*.generated.*'
           )
-          RANGE="origin/$BASE...HEAD"
+          RANGE="$BASE_REF...HEAD"
 
           git diff --numstat "$RANGE" -- . "${EXCLUDES[@]}" > /tmp/numstat.txt
           SIZE=$(awk '$1 != "-" { s += $1 + $2 } END { print s + 0 }' /tmp/numstat.txt)
@@ -179,6 +187,7 @@ jobs:
 
           {
             echo "base=$BASE"
+            echo "base_ref=$BASE_REF"
             echo "size_lines=$SIZE"
             echo "has_delta=$HAS_DELTA"
             echo "last_sha=$LAST_SHA"
@@ -345,7 +354,7 @@ jobs:
           # itself: `github.base_ref` is empty on `issue_comment`, which silently
           # turned the `/review` pre-pass into a no-op.
           semgrep --config .semgrep/propmind-conventions.yml \
-            --baseline-commit "origin/${{ steps.context.outputs.base }}" \
+            --baseline-commit "${{ steps.context.outputs.base_ref }}" \
             --json --output /tmp/semgrep.json \
             . || true
 
@@ -398,7 +407,7 @@ jobs:
 
             **Turn 1 — read in one parallel batch:** `${{ env.CONTEXT_DIR }}/pr.md` (metadata, size, CI, commits, description), `${{ env.CONTEXT_DIR }}/discussion.md` (human comments and the previous automated review)${{ steps.context.outputs.diff_parts != '' && format(', and every diff part: {0} (all under {1})', steps.context.outputs.diff_parts, env.CONTEXT_DIR) || '' }}${{ steps.context.outputs.has_delta == 'true' && format(', and `{0}/delta-since-last-review.patch`', env.CONTEXT_DIR) || '' }}.
 
-            Then look further only where the diff needs it: `Read` a file around a changed hunk, `Grep` a call site, `git log`/`git show` for intent. The base branch is `origin/${{ steps.context.outputs.base }}`.
+            Then look further only where the diff needs it: `Read` a file around a changed hunk, `Grep` a call site, `git log`/`git show` for intent. The base is `${{ steps.context.outputs.base_ref }}` (branch `${{ steps.context.outputs.base }}`); diff with `git diff ${{ steps.context.outputs.base_ref }}...HEAD -- <path>`.
             ${{ steps.context.outputs.has_delta == 'true' && format('
             **This is a re-review.** The bot already reviewed commit `{0}`. Concentrate on `delta-since-last-review.patch`; for the rest, carry forward the previous findings that still apply (check them against the current code) and drop the ones that were fixed or convincingly contested in the discussion. The verdict covers the whole PR.', steps.context.outputs.last_sha) || '' }}
 
