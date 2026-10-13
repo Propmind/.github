@@ -36,11 +36,6 @@ on:
         type: number
         default: 80
         description: "Hard cap on agent turns, a safety net well above a normal review. A run that hits it publishes nothing and fails the check."
-      comment_only:
-        required: false
-        type: boolean
-        default: false
-        description: "Publish every review as COMMENT, whatever the verdict, so the reviewer never blocks a merge."
       dry_run:
         required: false
         type: boolean
@@ -323,7 +318,6 @@ jobs:
             Propmind/consumer-baas) FRAGMENT="project-consumer-baas" ;;
             Propmind/clicksign-worker) FRAGMENT="project-clicksign-worker" ;;
             Propmind/propmind-nfse-emitter) FRAGMENT="project-nfse-emitter" ;;
-            Propmind/propmind-ai-agents) FRAGMENT="project-propmind-ai-agents" ;;
             *) FRAGMENT="" ;;
           esac
 
@@ -502,11 +496,6 @@ jobs:
               "⚠️ The automated review did not finish (no review was produced — likely the turn cap of ${{ inputs.max_turns }} or an API error). See the [run log]($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID). Comment \`/review\` to try again." || true
             echo "::error::Reviewer returned no review (structured output missing or invalid)."
             exit 1
-          fi
-
-          # A comment-only repo keeps the verdict in the body but never blocks.
-          if [ "${{ inputs.comment_only }}" = "true" ]; then
-            VERDICT=COMMENT
           fi
 
           # GitHub rejects review bodies above 65,536 characters.
