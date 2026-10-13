@@ -10,7 +10,7 @@ on:
       convention_docs:
         required: true
         type: string
-        description: "Comma-separated list of convention doc paths to read (e.g., 'AGENTS.md,.github/copilot-instructions.md')"
+        description: "Comma-separated list of convention doc paths the reviewer may consult (e.g., 'AGENTS.md,.github/copilot-instructions.md')"
       service_type:
         required: false
         type: string
@@ -29,8 +29,23 @@ on:
       model:
         required: false
         type: string
-        default: "claude-sonnet-5"
+        default: "claude-opus-5-5"
         description: "Claude model to use for the review"
+      max_turns:
+        required: false
+        type: number
+        default: 80
+        description: "Hard cap on agent turns, a safety net well above a normal review. A run that hits it publishes nothing and fails the check."
+      dry_run:
+        required: false
+        type: boolean
+        default: false
+        description: "Validation mode: write the review to the step summary instead of the PR, and hide the PR discussion and the bot's previous review from the reviewer."
+      head_sha:
+        required: false
+        type: string
+        default: ""
+        description: "Dry run only: review this commit instead of the PR head, to replay the exact state an earlier review saw."
     secrets:
       ANTHROPIC_API_KEY:
         required: true
@@ -48,41 +63,164 @@ jobs:
     name: Review PR
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      PR_NUMBER: ${{ inputs.pr_number }}
+      REPO: ${{ github.repository }}
+      CONTEXT_DIR: /tmp/review-context
     steps:
+      # Check out the PR head explicitly. On `issue_comment` (the `/review` path)
+      # the default ref is the base branch, so the reviewer used to read `main`
+      # instead of the code under review.
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.dry_run && inputs.head_sha || format('refs/pull/{0}/head', inputs.pr_number) }}
           fetch-depth: 0
 
-      - name: Route model by PR size
-        id: route
+      # Everything the agent used to fetch with tool calls in its first turns is
+      # gathered here instead. Every agent turn re-reads the whole context, so a
+      # fact fetched by the shell costs nothing per turn while a fact fetched by a
+      # tool call costs one turn plus its share of every turn after it.
+      - name: Gather PR context
+        id: context
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Sonnet 5 is overkill for XS/S PRs (< 200 lines changed). Route
-          # those to Haiku 4.5 (50% cheaper input). M+ PRs keep Sonnet —
-          # they need the stronger reasoning for cross-file logic.
-          # Caller can override by passing a non-default `model` input.
-          STATS=$(gh pr view ${{ inputs.pr_number }} -R ${{ github.repository }} \
-                    --json additions,deletions 2>/dev/null || echo '{"additions":0,"deletions":0}')
-          ADDS=$(echo "$STATS" | jq -r '.additions // 0')
-          DELS=$(echo "$STATS" | jq -r '.deletions // 0')
-          TOTAL=$((ADDS + DELS))
+          mkdir -p "$CONTEXT_DIR"
 
-          if [ "${{ inputs.model }}" != "claude-sonnet-5" ]; then
-            # Caller explicitly chose a model — respect it.
+          gh pr view "$PR_NUMBER" -R "$REPO" \
+            --json number,title,body,url,author,headRefName,baseRefName \
+            > "$CONTEXT_DIR/pr.json"
+          BASE=$(jq -r .baseRefName "$CONTEXT_DIR/pr.json")
+          # Diff against the base commit GitHub records for the PR, not the base
+          # branch tip: the branch may be gone (a stacked PR's base deleted after
+          # its own merge), or may already contain the PR head (a merge-commit
+          # merge), which makes `branch...HEAD` empty.
+          BASE_REF=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .base.sha)
+          git fetch --no-tags --quiet origin "$BASE_REF"
+
+          # Lockfiles, snapshots and build output carry no reviewable logic. They
+          # stay out of the diff and out of the size that picks the model.
+          EXCLUDES=(
+            ':(exclude,glob)**/package-lock.json' ':(exclude,glob)**/yarn.lock'
+            ':(exclude,glob)**/pnpm-lock.yaml' ':(exclude,glob)**/uv.lock'
+            ':(exclude,glob)**/poetry.lock' ':(exclude,glob)**/Pipfile.lock'
+            ':(exclude,glob)**/bun.lock' ':(exclude,glob)**/bun.lockb'
+            ':(exclude,glob)**/__snapshots__/**' ':(exclude,glob)**/*.snap'
+            ':(exclude,glob)**/*.min.js' ':(exclude,glob)**/*.min.css'
+            ':(exclude,glob)**/dist/**' ':(exclude,glob)**/*.generated.*'
+          )
+          RANGE="$BASE_REF...HEAD"
+
+          git diff --numstat "$RANGE" -- . "${EXCLUDES[@]}" > /tmp/numstat.txt
+          SIZE=$(awk '$1 != "-" { s += $1 + $2 } END { print s + 0 }' /tmp/numstat.txt)
+          FILES=$(wc -l < /tmp/numstat.txt | tr -d ' ')
+          SKIPPED=$(git diff --name-only "$RANGE" | grep -vxFf <(awk '{ print $3 }' /tmp/numstat.txt) || true)
+
+          # Split the diff so every part fits in one `Read` call (the tool pages
+          # long files, and each page is another turn).
+          git diff "$RANGE" -- . "${EXCLUDES[@]}" > /tmp/full.patch
+          TOTAL_LINES=$(wc -l < /tmp/full.patch | tr -d ' ')
+          MAX_LINES=12000
+          head -n "$MAX_LINES" /tmp/full.patch | split -l 1500 -d -a 2 --additional-suffix=.patch - "$CONTEXT_DIR/diff-"
+          DIFF_PARTS=$(find "$CONTEXT_DIR" -name 'diff-*.patch' -printf '%f\n' | sort | paste -sd, -)
+
+          # A re-review (`/review` after new pushes) only needs to look closely at
+          # what changed since the bot's last review of this PR.
+          # In a dry run the previous review is hidden, so the run is judged on
+          # its own findings instead of copying the ones it is compared against.
+          : > "$CONTEXT_DIR/last-bot-review.json"
+          if [ "${{ inputs.dry_run }}" != "true" ]; then
+            gh api "repos/$REPO/pulls/$PR_NUMBER/reviews?per_page=100" --paginate --slurp \
+              | jq '[.[][] | select(.user.login | endswith("[bot]")) | select(.body | startswith("## PR Review"))] | last // empty' \
+              > "$CONTEXT_DIR/last-bot-review.json" || true
+          fi
+          LAST_SHA=$(jq -r '.commit_id // empty' "$CONTEXT_DIR/last-bot-review.json" 2>/dev/null || true)
+          HAS_DELTA=false
+          if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" != "$(git rev-parse HEAD)" ] \
+             && git merge-base --is-ancestor "$LAST_SHA" HEAD 2>/dev/null; then
+            git diff "$LAST_SHA..HEAD" -- . "${EXCLUDES[@]}" | head -n 3000 > "$CONTEXT_DIR/delta-since-last-review.patch"
+            HAS_DELTA=true
+          fi
+
+          # `gh pr checks` exits non-zero while checks are pending or failing, so
+          # judge it by its output, not its status.
+          CI=$(gh pr checks "$PR_NUMBER" -R "$REPO" --json name,bucket \
+                 --jq 'map("\(.name): \(.bucket)") | join(", ")' 2>/dev/null || true)
+          CI=${CI:-unknown (not readable by this token)}
+
+          {
+            echo "# PR #$PR_NUMBER — $(jq -r .title "$CONTEXT_DIR/pr.json")"
+            echo
+            echo "- URL: $(jq -r .url "$CONTEXT_DIR/pr.json")"
+            echo "- Author: @$(jq -r .author.login "$CONTEXT_DIR/pr.json")"
+            echo "- Branch: $(jq -r .headRefName "$CONTEXT_DIR/pr.json") → $BASE"
+            echo "- Size: $SIZE lines in $FILES files (lockfiles/generated excluded)"
+            echo "- CI: $CI"
+            echo "- Diff parts: ${DIFF_PARTS:-none} ($TOTAL_LINES diff lines$( [ "$TOTAL_LINES" -gt "$MAX_LINES" ] && echo "; TRUNCATED at $MAX_LINES — use \`git diff $RANGE -- <path>\` for the rest"))"
+            if [ -n "$SKIPPED" ]; then
+              echo "- Excluded from diff (lockfiles/generated/binary):"
+              while IFS= read -r F; do echo "  - $F"; done <<< "$SKIPPED"
+            fi
+            echo
+            echo "## Commits"
+            # shellcheck disable=SC2016 # the backticks are Markdown, not expansion
+            git log --reverse --no-merges --format='- `%h` %s' "$BASE_REF..HEAD"
+            echo
+            echo "## Description"
+            jq -r '(.body // "(empty)")[0:8000]' "$CONTEXT_DIR/pr.json"
+          } > "$CONTEXT_DIR/pr.md"
+
+          # Human discussion, so the reviewer can honour contested findings, plus
+          # the bot's previous review so it does not repeat itself. A dry run
+          # hides it: it replays a past state, and later comments would leak how
+          # the earlier review's findings turned out.
+          {
+            echo "# Discussion on PR #$PR_NUMBER"
+            echo
+            [ "${{ inputs.dry_run }}" = "true" ] && echo "(hidden in dry run)" || gh api "repos/$REPO/issues/$PR_NUMBER/comments" --paginate \
+              --jq '.[] | select(.user.type != "Bot") | "### @\(.user.login) — \(.created_at)\n\n\(.body[0:3000])\n"' \
+              | tail -c 60000 || true
+            if [ -s "$CONTEXT_DIR/last-bot-review.json" ]; then
+              echo
+              echo "## Previous automated review (commit \`${LAST_SHA:0:7}\`)"
+              echo
+              jq -r '.body[0:12000]' "$CONTEXT_DIR/last-bot-review.json"
+            fi
+          } > "$CONTEXT_DIR/discussion.md"
+          rm -f "$CONTEXT_DIR/pr.json" "$CONTEXT_DIR/last-bot-review.json"
+
+          {
+            echo "base=$BASE"
+            echo "base_ref=$BASE_REF"
+            echo "size_lines=$SIZE"
+            echo "has_delta=$HAS_DELTA"
+            echo "last_sha=$LAST_SHA"
+            echo "diff_parts=$DIFF_PARTS"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Route model by PR size
+        id: route
+        run: |
+          set -euo pipefail
+          # M+ PRs go to Opus 5.5: in replays of already-reviewed PRs it found
+          # more of the known findings than Sonnet 5 and cost less per review
+          # (fewer turns outweigh the higher token price). XS/S PRs (< 200 lines)
+          # go to Haiku. Size excludes lockfiles and generated files, so a small
+          # change that bumps a dependency no longer lands on the larger model.
+          # Caller can override by passing a non-default `model` input.
+          TOTAL=${{ steps.context.outputs.size_lines }}
+          if [ "${{ inputs.model }}" != "claude-opus-5-5" ]; then
             CHOSEN="${{ inputs.model }}"
             REASON="explicit caller override"
           elif [ "$TOTAL" -lt 200 ]; then
             CHOSEN="claude-haiku-4-5"
             REASON="XS/S size ($TOTAL lines) routed to Haiku"
           else
-            CHOSEN="claude-sonnet-5"
-            REASON="M+ size ($TOTAL lines) routed to Sonnet"
+            CHOSEN="claude-opus-5-5"
+            REASON="M+ size ($TOTAL lines) routed to Opus"
           fi
-
           echo "model=$CHOSEN" >> "$GITHUB_OUTPUT"
-          echo "size_lines=$TOTAL" >> "$GITHUB_OUTPUT"
           echo "🤖 Model: $CHOSEN — $REASON" >&2
 
       - name: Check Linear availability
@@ -169,7 +307,6 @@ jobs:
         id: rules
         env:
           GH_TOKEN: ${{ github.token }}
-          REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
 
@@ -220,12 +357,11 @@ jobs:
           set -euo pipefail
           pip install --quiet semgrep
           # Only report findings introduced by the PR (delta vs its base branch).
-          # Pre-existing legacy violations stay quiet. Use the PR's base ref —
-          # `main` in propmind-core, `develop` in control-panel-ui — so the
-          # diff is against the right reference per repo's branching model.
-          BASE_REF="${{ github.base_ref }}"
+          # Pre-existing legacy violations stay quiet. The base comes from the PR
+          # itself: `github.base_ref` is empty on `issue_comment`, which silently
+          # turned the `/review` pre-pass into a no-op.
           semgrep --config .semgrep/propmind-conventions.yml \
-            --baseline-commit "origin/${BASE_REF}" \
+            --baseline-commit "${{ steps.context.outputs.base_ref }}" \
             --json --output /tmp/semgrep.json \
             . || true
 
@@ -249,70 +385,45 @@ jobs:
             echo "findings=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Detect stale CHANGES_REQUESTED
-        id: stale
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          # Pre-check whether any bot-authored CHANGES_REQUESTED reviews are
-          # active on this PR. If none, the dismiss step in Phase 3 is omitted
-          # entirely from the prompt — saves tokens + turns on most reviews.
-          HAS_STALE=$(gh api "repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews" \
-            --jq '[.[] | select(.user.login | endswith("[bot]")) | select(.state == "CHANGES_REQUESTED")] | length' 2>/dev/null || echo "0")
-          if [ "$HAS_STALE" -gt 0 ]; then
-            echo "has_stale=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "has_stale=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - uses: anthropics/claude-code-action@beta
+      # The agent only reads and judges. It has no tool that writes to GitHub:
+      # it returns the review as structured output and the next step publishes
+      # it. Publishing used to cost several turns per run (wrong tool name,
+      # denied heredoc fallback, retries that re-sent the whole body).
+      - uses: anthropics/claude-code-action@v1
+        id: claude
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
           github_token: ${{ github.token }}
-          model: ${{ steps.route.outputs.model }}
-          # Phase 0 asks for the four read tools below. They were absent here, so
-          # every run burned turns on denied calls before falling back to `gh api`.
-          allowed_tools: "mcp__github__get_pull_request,mcp__github__get_pull_request_files,mcp__github__get_pull_request_status,mcp__github__get_pull_request_reviews,mcp__github__create_pull_request_review,Bash(cat:*),Bash(gh api:*)"
-          direct_prompt: |
+          claude_args: >-
+            --model ${{ steps.route.outputs.model }}
+            --max-turns ${{ inputs.max_turns }}
+            --add-dir ${{ env.CONTEXT_DIR }}
+            --allowedTools "Read,Grep,Glob,Bash(git diff:*),Bash(git log:*),Bash(git show:*),Bash(git blame:*)"
+            --json-schema '{"type":"object","properties":{"verdict":{"type":"string","enum":["APPROVE","COMMENT","REQUEST_CHANGES"]},"body":{"type":"string"}},"required":["verdict","body"],"additionalProperties":false}'
+          prompt: |
             You are an experienced code reviewer for Propmind (Brazilian real estate SaaS).
-            Review PR #${{ inputs.pr_number }} in repository ${{ github.repository }}.
+            Review PR #${{ inputs.pr_number }} in repository ${{ github.repository }}. The PR head is checked out in the working directory.
             ${{ inputs.mode == 'comment' && format('Requested via /review by @{0}.', inputs.comment_author) || '' }}
 
-            **Never `Read` a path under `/tmp/github-images/`.** Those files are staged
-            by this action, not by the PR author — one of them is the action's own
-            "Claude Code is working…" progress spinner, an animated GIF saved with a
-            `.png` extension. Reading it sends a GIF declared as PNG to the API and the
-            whole run dies on a 400. Nothing there is PR content; ignore every `<img>`
-            pointing at that directory.
+            ## How to work
 
-            ---
+            Every turn re-reads everything gathered so far, so save turns by **batching**, never by skipping verification:
+            - Issue independent tool calls together in one turn (several `Read`/`Grep` at once), never one by one.
+            - Do trace what the change relies on: callers, the domain or ledger rules a computation must agree with, other modules that produce the same value. A cross-file inconsistency is the finding a diff-only reading misses.
+            - Do not run tests, linters, type checkers or builds (`pytest`, `vitest`, `lint-imports`, `npm`, `uv run`); CI runs them and they are not available here. Use plain `git`, `Read`, `Grep` and `Glob` calls, without `cd` or pipes.
+            - Nothing below needs a GitHub tool. You cannot publish; return the review as structured output and the workflow publishes it.
 
-            ## Phase 0 — Detect Context
+            **Turn 1 — read in one parallel batch:** `${{ env.CONTEXT_DIR }}/pr.md` (metadata, size, CI, commits, description), `${{ env.CONTEXT_DIR }}/discussion.md` (human comments and the previous automated review)${{ steps.context.outputs.diff_parts != '' && format(', and every diff part: {0} (all under {1})', steps.context.outputs.diff_parts, env.CONTEXT_DIR) || '' }}${{ steps.context.outputs.has_delta == 'true' && format(', and `{0}/delta-since-last-review.patch`', env.CONTEXT_DIR) || '' }}.
 
-            Run in parallel:
-            - `mcp__github__get_pull_request` — PR metadata
-            - `mcp__github__get_pull_request_files` — changed files with patches
-            - `mcp__github__get_pull_request_status` — CI status
-            ${{ inputs.mode == 'comment' && '- `mcp__github__get_pull_request_reviews` — check existing reviews to avoid duplicates' || '' }}
+            Then look further only where the diff needs it: `Read` a file around a changed hunk, `Grep` a call site, `git log`/`git show` for intent. The base is `${{ steps.context.outputs.base_ref }}` (branch `${{ steps.context.outputs.base }}`); diff with `git diff ${{ steps.context.outputs.base_ref }}...HEAD -- <path>`.
+            ${{ steps.context.outputs.has_delta == 'true' && format('
+            **This is a re-review.** The bot already reviewed commit `{0}`. Concentrate on `delta-since-last-review.patch`; for the rest, carry forward the previous findings that still apply (check them against the current code) and drop the ones that were fixed or convincingly contested in the discussion. The verdict covers the whole PR.', steps.context.outputs.last_sha) || '' }}
 
-            Extract Linear ID from branch with `[A-Za-z]{2,5}-\d+` (UPPERCASE). Ex: `fix/pmt-4-charges` → `PMT-4`.
+            **Convention docs** (sole authority for violations — only flag rules documented there or in the rules below): ${{ inputs.convention_docs }}. They are long. `Grep` them for the area the diff touches and read only those sections.
+
+            **Linear**: ${{ steps.linear.outputs.found == 'true' && 'the issue is inlined below — there is no Linear tool to call, and no other source. Use it for the Linear Alignment section.' || 'no issue was resolved for this branch. Write "No linked issue — review based on code only" in the Linear Alignment section, and do not present anything as an acceptance criterion. The PR description and the branch name remain valid context for intent — just never quoted as requirements.' }}
 
             **Batch size** by total lines changed: XS <50 / S 50–200 / M 200–500 / L 500–1000 (WARNING suggesting split) / XL 1000+ (batch size = main finding, defect detection ~28%).
-
-            **Read strategy:** `SINGLE_DIFF` for XS/S or ≤2 commits or messy commits · `PER_COMMIT` for M+ with 3+ well-structured commits.
-
-            ---
-
-            ## Phase 1 — Gather
-
-            Run in parallel:
-            - **Convention docs** (sole authority for violations — only flag rules documented here): ${{ inputs.convention_docs }}
-            - **Linear**: ${{ steps.linear.outputs.found == 'true' && 'the issue is inlined below — there is no Linear tool to call, and no other source. Use it for the Linear Alignment section.' || 'no issue was resolved for this branch. Write "No linked issue — review based on code only" in the Linear Alignment section, and do not present anything as an acceptance criterion. The PR description and the branch name remain valid context for intent — just never quoted as requirements.' }}
-            - **PR comments**: `gh api repos/${{ github.repository }}/issues/${{ inputs.pr_number }}/comments` for author contests of prior findings.
-
-            For L/XL PRs apply risk-based file prioritization (see below).
-            For `PER_COMMIT`: read consolidated diff first; consult individual commits only when intent is ambiguous.
             ${{ steps.linear.outputs.found == 'true' && format('
             ### Linked Linear issue
 
@@ -321,7 +432,7 @@ jobs:
 
             ---
 
-            ## Phase 2 — Analyze${{ inputs.service_type != '' && format(' (Service type: **{0}**)', inputs.service_type) || '' }}
+            ## Analyze${{ inputs.service_type != '' && format(' (Service type: **{0}**)', inputs.service_type) || '' }}
 
             **Strict finding contract — only emit findings that match:**
 
@@ -355,23 +466,99 @@ jobs:
 
             ---
 
-            ## Phase 3 — Report and Publish
+            ## Report
 
-            Format using:
+            Format `body` using:
 
             ${{ steps.rules.outputs.templates }}
 
-            Verdict: any CRITICAL → `REQUEST_CHANGES` · WARNING only → `COMMENT` · neither → `APPROVE`.
+            `verdict`: any CRITICAL → `REQUEST_CHANGES` · WARNING only → `COMMENT` · neither → `APPROVE`.
 
-            **Publish — do NOT deviate:**
+            Return `{verdict, body}` as your final structured output. Do not try to post anything.
 
-            1. Try `mcp__github__create_pull_request_review` with owner/repo from `${{ github.repository }}`, pull_number `${{ inputs.pr_number }}`, body, event.
-            2. On body-size/escaping error: write body to `/tmp/pr_review.md` via `cat <<'REVIEW_EOF' > /tmp/pr_review.md` HEREDOC (quoted sentinel), then `gh api repos/${{ github.repository }}/pulls/${{ inputs.pr_number }}/reviews --method POST --field event="<event>" --field "body=@/tmp/pr_review.md"`.
-            3. On any further failure: **stop**, report the error verbatim. No `curl`, scripts, sub-agents, or other variants.
-            ${{ steps.stale.outputs.has_stale == 'true' && format('
-            **Dismiss stale CHANGES_REQUESTED.** This PR has a prior bot `CHANGES_REQUESTED` review still active. If your new verdict is `APPROVE` or `COMMENT`:
-            1. Fetch reviews via `mcp__github__get_pull_request_reviews`.
-            2. For each review where `user.login` ends with `[bot]` AND `state == "CHANGES_REQUESTED"`, dismiss it: `gh api repos/{0}/pulls/{1}/reviews/<review_id>/dismissals --method PUT --field message="Superseded by new automated review."` (one call per stale review).
-            3. Skip dismissal if your verdict is `REQUEST_CHANGES`.', github.repository, inputs.pr_number) || '' }}
+      - name: Publish review
+        if: ${{ !cancelled() && steps.claude.outcome != 'skipped' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STRUCTURED: ${{ steps.claude.outputs.structured_output }}
+        run: |
+          set -euo pipefail
+          VERDICT=$(printf '%s' "${STRUCTURED:-}" | jq -r '.verdict // empty' 2>/dev/null || true)
+          printf '%s' "${STRUCTURED:-}" | jq -r '.body // empty' 2>/dev/null > /tmp/pr_review.md || true
 
-            Publish directly — no confirmation.
+          case "$VERDICT" in
+            APPROVE|COMMENT|REQUEST_CHANGES) ;;
+            *) VERDICT="" ;;
+          esac
+
+          if [ -z "$VERDICT" ] || [ ! -s /tmp/pr_review.md ]; then
+            [ "${{ inputs.dry_run }}" = "true" ] || gh pr comment "$PR_NUMBER" -R "$REPO" --body \
+              "⚠️ The automated review did not finish (no review was produced — likely the turn cap of ${{ inputs.max_turns }} or an API error). See the [run log]($GITHUB_SERVER_URL/$REPO/actions/runs/$GITHUB_RUN_ID). Comment \`/review\` to try again." || true
+            echo "::error::Reviewer returned no review (structured output missing or invalid)."
+            exit 1
+          fi
+
+          # GitHub rejects review bodies above 65,536 characters.
+          if [ "$(wc -c < /tmp/pr_review.md)" -gt 65000 ]; then
+            head -c 64000 /tmp/pr_review.md > /tmp/pr_review.trunc
+            printf '\n\n_(review truncated to fit GitHub limits)_\n' >> /tmp/pr_review.trunc
+            mv /tmp/pr_review.trunc /tmp/pr_review.md
+          fi
+
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            {
+              echo "### Dry run — $VERDICT review for #$PR_NUMBER (not published)"
+              echo
+              cat /tmp/pr_review.md
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::notice::Dry run: $VERDICT review for #$PR_NUMBER written to the step summary."
+            exit 0
+          fi
+
+          gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --method POST \
+            --field event="$VERDICT" --field "body=@/tmp/pr_review.md" > /dev/null
+
+          # A new non-blocking verdict supersedes any blocking one the bot left
+          # earlier; otherwise a stale CHANGES_REQUESTED stays until dismissed.
+          if [ "$VERDICT" != "REQUEST_CHANGES" ]; then
+            gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" --paginate \
+              --jq '.[] | select(.user.login | endswith("[bot]")) | select(.state == "CHANGES_REQUESTED") | .id' \
+              | while read -r ID; do
+                  gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$ID/dismissals" --method PUT \
+                    --field message="Superseded by new automated review." > /dev/null || true
+                done
+          fi
+          echo "::notice::Published $VERDICT review on #$PR_NUMBER."
+
+      # One line per run with what it cost, so the next tuning round reads the
+      # step summary instead of downloading logs.
+      - name: Report usage
+        if: ${{ !cancelled() && steps.claude.outputs.execution_file != '' }}
+        env:
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+          MODEL: ${{ steps.route.outputs.model }}
+          SIZE: ${{ steps.context.outputs.size_lines }}
+        run: |
+          RESULT=$(jq -c '[.[] | select(.type == "result")] | last // {}' "$EXECUTION_FILE" 2>/dev/null || echo '{}')
+          TURNS=$(echo "$RESULT" | jq -r '.num_turns // "?"')
+          COST=$(echo "$RESULT" | jq -r '(.total_cost_usd // 0) * 100 | round / 100')
+          DENIALS=$(echo "$RESULT" | jq -r '(.permission_denials // []) | length')
+          SUBTYPE=$(echo "$RESULT" | jq -r '.subtype // "?"')
+          DENIED=$(echo "$RESULT" | jq -r '(.permission_denials // [])[] | "\(.tool_name): \((.tool_input.command // .tool_input.file_path // .tool_input.pattern // "") | tostring | .[0:80])"')
+          echo "::notice::review-usage model=$MODEL size=$SIZE turns=$TURNS cost_usd=$COST denials=$DENIALS result=$SUBTYPE"
+          {
+            echo "### Review usage"
+            echo
+            echo "| Model | Size (lines) | Turns | Cost (USD) | Denied tool calls | Result |"
+            echo "|---|---|---|---|---|---|"
+            echo "| $MODEL | $SIZE | $TURNS | $COST | $DENIALS | $SUBTYPE |"
+            if [ -n "$DENIED" ]; then
+              echo
+              echo "Denied tool calls:"
+              echo
+              while IFS= read -r D; do echo "- \`$D\`"; done <<< "$DENIED"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r D; do
+            if [ -n "$D" ]; then echo "::notice::review-denied $D"; fi
+          done <<< "$DENIED"
