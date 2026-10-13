@@ -34,7 +34,7 @@ on:
       max_turns:
         required: false
         type: number
-        default: 60
+        default: 80
         description: "Hard cap on agent turns, a safety net well above a normal review. A run that hits it publishes nothing and fails the check."
       dry_run:
         required: false
@@ -405,9 +405,10 @@ jobs:
 
             ## How to work
 
-            You have at most ${{ inputs.max_turns }} turns. Every turn re-reads everything gathered so far, so:
-            - Issue independent tool calls together in one turn, never one by one.
-            - Read what the review needs, not whole files or whole docs by default.
+            Every turn re-reads everything gathered so far, so save turns by **batching**, never by skipping verification:
+            - Issue independent tool calls together in one turn (several `Read`/`Grep` at once), never one by one.
+            - Do trace what the change relies on: callers, the domain or ledger rules a computation must agree with, other modules that produce the same value. A cross-file inconsistency is the finding a diff-only reading misses.
+            - Do not run tests, linters, type checkers or builds (`pytest`, `vitest`, `lint-imports`, `npm`, `uv run`); CI runs them and they are not available here. Use plain `git`, `Read`, `Grep` and `Glob` calls, without `cd` or pipes.
             - Nothing below needs a GitHub tool. You cannot publish; return the review as structured output and the workflow publishes it.
 
             **Turn 1 — read in one parallel batch:** `${{ env.CONTEXT_DIR }}/pr.md` (metadata, size, CI, commits, description), `${{ env.CONTEXT_DIR }}/discussion.md` (human comments and the previous automated review)${{ steps.context.outputs.diff_parts != '' && format(', and every diff part: {0} (all under {1})', steps.context.outputs.diff_parts, env.CONTEXT_DIR) || '' }}${{ steps.context.outputs.has_delta == 'true' && format(', and `{0}/delta-since-last-review.patch`', env.CONTEXT_DIR) || '' }}.
@@ -556,4 +557,6 @@ jobs:
               while IFS= read -r D; do echo "- \`$D\`"; done <<< "$DENIED"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
-          while IFS= read -r D; do [ -n "$D" ] && echo "::notice::review-denied $D"; done <<< "$DENIED"
+          while IFS= read -r D; do
+            if [ -n "$D" ]; then echo "::notice::review-denied $D"; fi
+          done <<< "$DENIED"
