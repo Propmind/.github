@@ -34,8 +34,8 @@ on:
       max_turns:
         required: false
         type: number
-        default: 40
-        description: "Hard cap on agent turns. A run that hits it publishes nothing and fails the check."
+        default: 60
+        description: "Hard cap on agent turns, a safety net well above a normal review. A run that hits it publishes nothing and fails the check."
       dry_run:
         required: false
         type: boolean
@@ -87,15 +87,12 @@ jobs:
             --json number,title,body,url,author,headRefName,baseRefName,headRefOid,commits \
             > "$CONTEXT_DIR/pr.json"
           BASE=$(jq -r .baseRefName "$CONTEXT_DIR/pr.json")
-          # A stacked PR's base branch may already be gone (deleted after its own
-          # merge); fall back to the base commit GitHub recorded for the PR.
-          if git fetch --no-tags --quiet origin "+refs/heads/$BASE:refs/remotes/origin/$BASE" 2>/dev/null; then
-            BASE_REF="origin/$BASE"
-          else
-            BASE_REF=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .base.sha)
-            git fetch --no-tags --quiet origin "$BASE_REF"
-            echo "::warning::Base branch '$BASE' not found; diffing against base commit ${BASE_REF:0:7}."
-          fi
+          # Diff against the base commit GitHub records for the PR, not the base
+          # branch tip: the branch may be gone (a stacked PR's base deleted after
+          # its own merge), or may already contain the PR head (a merge-commit
+          # merge), which makes `branch...HEAD` empty.
+          BASE_REF=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq .base.sha)
+          git fetch --no-tags --quiet origin "$BASE_REF"
 
           # Lockfiles, snapshots and build output carry no reviewable logic. They
           # stay out of the diff and out of the size that picks the model.
