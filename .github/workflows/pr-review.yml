@@ -30,7 +30,12 @@ on:
         required: false
         type: string
         default: "claude-opus-5-5"
-        description: "Claude model to use for the review"
+        description: "Claude model for M+ PRs (200+ lines). Any other value overrides the size routing for every PR."
+      small_pr_model:
+        required: false
+        type: string
+        default: "claude-haiku-5-5"
+        description: "Claude model for XS/S PRs (< 200 lines)"
       max_turns:
         required: false
         type: number
@@ -214,7 +219,8 @@ jobs:
           # M+ PRs go to Opus 5.5: in replays of already-reviewed PRs it found
           # more of the known findings than Sonnet 5 and cost less per review
           # (fewer turns outweigh the higher token price). XS/S PRs (< 200 lines)
-          # go to Haiku. Size excludes lockfiles and generated files, so a small
+          # go to Haiku 5.5: in the same kind of replay it found more than
+          # Haiku 4.5 and Opus 5.5 on small PRs, at about a tenth of the cost. Size excludes lockfiles and generated files, so a small
           # change that bumps a dependency no longer lands on the larger model.
           # Caller can override by passing a non-default `model` input.
           TOTAL=${{ steps.context.outputs.size_lines }}
@@ -222,8 +228,8 @@ jobs:
             CHOSEN="${{ inputs.model }}"
             REASON="explicit caller override"
           elif [ "$TOTAL" -lt 200 ]; then
-            CHOSEN="claude-haiku-4-5"
-            REASON="XS/S size ($TOTAL lines) routed to Haiku"
+            CHOSEN="${{ inputs.small_pr_model }}"
+            REASON="XS/S size ($TOTAL lines) routed to the small-PR model"
           else
             CHOSEN="claude-opus-5-5"
             REASON="M+ size ($TOTAL lines) routed to Opus"
