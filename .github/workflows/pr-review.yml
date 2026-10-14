@@ -34,7 +34,7 @@ on:
       small_pr_model:
         required: false
         type: string
-        default: "claude-haiku-4-5"
+        default: "claude-haiku-5-5"
         description: "Claude model for XS/S PRs (< 200 lines)"
       max_turns:
         required: false
@@ -219,7 +219,8 @@ jobs:
           # M+ PRs go to Opus 5.5: in replays of already-reviewed PRs it found
           # more of the known findings than Sonnet 5 and cost less per review
           # (fewer turns outweigh the higher token price). XS/S PRs (< 200 lines)
-          # go to Haiku. Size excludes lockfiles and generated files, so a small
+          # go to Haiku 5.5: in the same kind of replay it found more than
+          # Haiku 4.5 and Opus 5.5 on small PRs, at about a tenth of the cost. Size excludes lockfiles and generated files, so a small
           # change that bumps a dependency no longer lands on the larger model.
           # Caller can override by passing a non-default `model` input.
           TOTAL=${{ steps.context.outputs.size_lines }}
