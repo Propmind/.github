@@ -30,7 +30,12 @@ on:
         required: false
         type: string
         default: "claude-opus-5-5"
-        description: "Claude model to use for the review"
+        description: "Claude model for M+ PRs (200+ lines). Any other value overrides the size routing for every PR."
+      small_pr_model:
+        required: false
+        type: string
+        default: "claude-haiku-4-5"
+        description: "Claude model for XS/S PRs (< 200 lines)"
       max_turns:
         required: false
         type: number
@@ -222,8 +227,8 @@ jobs:
             CHOSEN="${{ inputs.model }}"
             REASON="explicit caller override"
           elif [ "$TOTAL" -lt 200 ]; then
-            CHOSEN="claude-haiku-4-5"
-            REASON="XS/S size ($TOTAL lines) routed to Haiku"
+            CHOSEN="${{ inputs.small_pr_model }}"
+            REASON="XS/S size ($TOTAL lines) routed to the small-PR model"
           else
             CHOSEN="claude-opus-5-5"
             REASON="M+ size ($TOTAL lines) routed to Opus"
