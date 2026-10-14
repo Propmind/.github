@@ -144,7 +144,10 @@ jobs:
           HAS_DELTA=false
           if [ -n "$LAST_SHA" ] && [ "$LAST_SHA" != "$(git rev-parse HEAD)" ] \
              && git merge-base --is-ancestor "$LAST_SHA" HEAD 2>/dev/null; then
-            git diff "$LAST_SHA..HEAD" -- . "${EXCLUDES[@]}" | head -n 3000 > "$CONTEXT_DIR/delta-since-last-review.patch"
+            # Write first, cut after: piping `git diff` into `head` kills it with
+            # SIGPIPE on a long delta, and pipefail turns that into a failed step.
+            git diff "$LAST_SHA..HEAD" -- . "${EXCLUDES[@]}" > /tmp/delta.patch
+            head -n 3000 /tmp/delta.patch > "$CONTEXT_DIR/delta-since-last-review.patch"
             HAS_DELTA=true
           fi
 
@@ -505,7 +508,10 @@ jobs:
           fi
 
           # A comment-only repo keeps the verdict in the body but never blocks.
-          if [ "${{ inputs.comment_only }}" = "true" ]; then
+          # GitHub also refuses an APPROVE from the workflow token (HTTP 422), so
+          # a clean review is published as COMMENT too; the verdict stays in the
+          # body. REQUEST_CHANGES is allowed and still blocks where it should.
+          if [ "${{ inputs.comment_only }}" = "true" ] || [ "$VERDICT" = "APPROVE" ]; then
             VERDICT=COMMENT
           fi
 
